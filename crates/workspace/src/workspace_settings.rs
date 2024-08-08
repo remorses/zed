@@ -79,7 +79,7 @@ pub struct WorkspaceSettingsContent {
     // Maximum open tabs in a pane. Will not close an unsaved
     // tab. Set to `0` for unlimited tabs.
     //
-    // Default: `5`
+    // Default: `0`
     pub max_tabs: Option<usize>,
     /// Controls previous session restoration in freshly launched Zed instance.
     /// Values: none, last_workspace, last_session
