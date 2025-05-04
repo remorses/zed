@@ -530,8 +530,6 @@ impl MacWindow {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
 
-            let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
-
             let mut style_mask;
             if let Some(titlebar) = titlebar.as_ref() {
                 style_mask = NSWindowStyleMask::NSClosableWindowMask
@@ -670,12 +668,12 @@ impl MacWindow {
                 .unwrap_or(false);
 
             if use_native_tabs {
-                // note: this should be `NSWindowTabbingModePreferred`, but the bindings are incorrect.
-                // (https://github.com/servo/core-foundation-rs/pull/714)
-                native_window.setTabbingMode_(NSWindowTabbingMode::NSWindowTabbingModePreferred);
-                let id_str = NSString::alloc(nil).init_str("main‑doc");      // same string for every window
-                let _: () = msg_send![native_view, setTabbingIdentifier: id_str];
-                let _: () = msg_send![native_view, mergeAllWindows: nil];
+                native_window.setTabbingMode_(NSWindowTabbingMode::NSWindowTabbingModeDisallowed);
+                let id_str = NSString::alloc(nil).init_str("main‑doc"); // same string for every window
+                let _: () = msg_send![native_window, setTabbingIdentifier: id_str];
+                let _: () = msg_send![native_window, mergeAllWindows: nil];
+            } else {
+                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
             }
 
             if let Some(title) = titlebar
