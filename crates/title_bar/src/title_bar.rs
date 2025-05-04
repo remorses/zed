@@ -20,14 +20,18 @@ use call::ActiveCall;
 use client::{Client, UserStore};
 use feature_flags::{FeatureFlagAppExt, NewBillingFeatureFlag};
 use gpui::{
+
     Action, AnyElement, App, Context, Corner, Decorations, Element, Entity, InteractiveElement,
-    Interactivity, IntoElement, MouseButton, ParentElement, Render, Stateful,
+    Interactivity, IntoElement, MouseButton, ParentElement, PromptLevel, Render, Stateful,
     StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, actions, div, px,
 };
 use onboarding_banner::OnboardingBanner;
 use project::Project;
 use rpc::proto;
-use settings::Settings as _;
+
+use settings::{Settings as _, SettingsStore};
+use workspace::WorkspaceSettings;
+
 use smallvec::SmallVec;
 use std::sync::Arc;
 use theme::ActiveTheme;
@@ -36,10 +40,12 @@ use ui::{
     IconWithIndicator, Indicator, PopoverMenu, Tooltip, h_flex, prelude::*,
 };
 use util::ResultExt;
+
 use workspace::{Workspace, notifications::NotifyResultExt};
 use zed_actions::{OpenBrowser, OpenRecent, OpenRemote};
 
 pub use onboarding_banner::restore_banner;
+
 
 #[cfg(feature = "stories")]
 pub use stories::*;
@@ -119,6 +125,7 @@ pub struct TitleBar {
     workspace: WeakEntity<Workspace>,
     should_move: bool,
     application_menu: Option<Entity<ApplicationMenu>>,
+    use_native_tabs: bool,
     _subscriptions: Vec<Subscription>,
     banner: Entity<OnboardingBanner>,
 }
@@ -147,7 +154,13 @@ impl Render for TitleBar {
                 if window.is_fullscreen() {
                     this.pl_2()
                 } else if self.platform_style == PlatformStyle::Mac {
-                    this.pl(px(platform_mac::TRAFFIC_LIGHT_PADDING))
+                    // When native tabs are enabled, the native titlebar is also displayed on top of the window.
+                    // Therefore, we don't need to add the traffic light padding that is normally needed for the custom titlebar.
+                    if self.use_native_tabs {
+                        this.pl_2()
+                    } else {
+                        this.pl(px(platform_mac::TRAFFIC_LIGHT_PADDING))
+                    }
                 } else {
                     this.pl_2()
                 }
@@ -296,6 +309,8 @@ impl TitleBar {
             }
         };
 
+        let use_native_tabs = WorkspaceSettings::get_global(cx).use_native_tabs;
+
         let mut subscriptions = Vec::new();
         subscriptions.push(
             cx.observe(&workspace.weak_handle().upgrade().unwrap(), |_, _, cx| {
@@ -306,6 +321,27 @@ impl TitleBar {
         subscriptions.push(cx.observe(&active_call, |this, _, cx| this.active_call_changed(cx)));
         subscriptions.push(cx.observe_window_activation(window, Self::window_activation_changed));
         subscriptions.push(cx.observe(&user_store, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
+            let use_native_tabs = WorkspaceSettings::get_global(cx).use_native_tabs;
+            if this.use_native_tabs != use_native_tabs {
+                let answer = window.prompt(
+                    PromptLevel::Warning,
+                    "A setting has changed that requires a restart to take effect.",
+                    Some("Press the restart button to restart Zed and enable the setting."),
+                    &["Cancel", "Restart"],
+                    cx,
+                );
+                cx.spawn(async move |_this, cx| {
+                    if let Ok(1) = answer.await {
+                        cx.update(|cx| {
+                            workspace::reload(&Default::default(), cx);
+                        }).log_err();
+                    }
+                    Ok::<(), gpui::Task<()>>(())
+                })
+                .detach_and_log_err(cx);
+            }
+        }));
 
         let banner = cx.new(|cx| {
             OnboardingBanner::new(
@@ -328,6 +364,7 @@ impl TitleBar {
             project,
             user_store,
             client,
+            use_native_tabs,
             _subscriptions: subscriptions,
             banner,
         }
