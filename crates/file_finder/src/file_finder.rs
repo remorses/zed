@@ -752,6 +752,7 @@ struct FileSearchQuery {
     raw_query: String,
     file_query_end: Option<usize>,
     path_position: PathWithPosition,
+    tokens: Vec<String>,
 }
 
 impl FileSearchQuery {
@@ -854,19 +855,32 @@ impl FileFinderDelegate {
         self.cancel_flag.store(true, atomic::Ordering::Relaxed);
         self.cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = self.cancel_flag.clone();
+        let tokens = query.tokens.clone();
         cx.spawn_in(window, async move |picker, cx| {
-            let matches = fuzzy::match_path_sets(
-                candidate_sets.as_slice(),
-                query.path_query(),
-                relative_to,
-                false,
-                100,
-                &cancel_flag,
-                cx.background_executor().clone(),
-            )
-            .await
-            .into_iter()
-            .map(ProjectPanelOrdMatch);
+            let raw_matches = if tokens.len() > 1 {
+                fuzzy::match_path_sets_tokens(
+                    candidate_sets.as_slice(),
+                    &tokens,
+                    relative_to,
+                    false,
+                    100,
+                    &cancel_flag,
+                    cx.background_executor().clone(),
+                )
+                .await
+            } else {
+                fuzzy::match_path_sets(
+                    candidate_sets.as_slice(),
+                    query.path_query(),
+                    relative_to,
+                    false,
+                    100,
+                    &cancel_flag,
+                    cx.background_executor().clone(),
+                )
+                .await
+            };
+            let matches = raw_matches.into_iter().map(ProjectPanelOrdMatch);
             let did_cancel = cancel_flag.load(atomic::Ordering::Relaxed);
             picker
                 .update(cx, |picker, cx| {
@@ -1237,6 +1251,11 @@ impl PickerDelegate for FileFinderDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
+        let tokens: Vec<String> = raw_query
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+
         let raw_query = raw_query.replace(' ', "");
         let raw_query = raw_query.trim();
 
@@ -1325,6 +1344,7 @@ impl PickerDelegate for FileFinderDelegate {
                     Some(path_position.path.to_str().unwrap().len())
                 },
                 path_position,
+                tokens,
             };
 
             if Path::new(query.path_query()).is_absolute() {

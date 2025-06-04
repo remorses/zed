@@ -3,6 +3,7 @@ use std::{
     borrow::Cow,
     cmp::{self, Ordering},
     path::Path,
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{self, AtomicBool},
@@ -216,6 +217,72 @@ pub async fn match_path_sets<'a, Set: PathMatchCandidateSet<'a>>(
     let mut results = segment_results.concat();
     util::truncate_to_bottom_n_sorted_by(&mut results, max_results, &|a, b| b.cmp(a));
     results
+}
+
+pub async fn match_path_sets_tokens<'a, Set: PathMatchCandidateSet<'a>>(
+    candidate_sets: &'a [Set],
+    tokens: &[String],
+    relative_to: Option<Arc<Path>>,
+    smart_case: bool,
+    max_results: usize,
+    cancel_flag: &AtomicBool,
+    executor: BackgroundExecutor,
+) -> Vec<PathMatch> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    if tokens.len() == 1 {
+        return match_path_sets(
+            candidate_sets,
+            &tokens[0],
+            relative_to,
+            smart_case,
+            max_results,
+            cancel_flag,
+            executor,
+        )
+        .await;
+    }
+
+    let mut token_results = futures::future::join_all(tokens.iter().map(|t| {
+        match_path_sets(
+            candidate_sets,
+            t,
+            relative_to.clone(),
+            smart_case,
+            max_results * 5,
+            cancel_flag,
+            executor.clone(),
+        )
+    }))
+    .await;
+
+    let mut map: std::collections::HashMap<(usize, Arc<Path>), PathMatch> =
+        token_results
+            .remove(0)
+            .into_iter()
+            .map(|m| ((m.worktree_id, m.path.clone()), m))
+            .collect();
+
+    for results in token_results.into_iter() {
+        let lookup: std::collections::HashMap<(usize, Arc<Path>), PathMatch> =
+            results.into_iter().map(|m| ((m.worktree_id, m.path.clone()), m)).collect();
+        map.retain(|k, v| {
+            if let Some(other) = lookup.get(k) {
+                v.score += other.score;
+                v.positions.extend_from_slice(&other.positions);
+                v.positions.sort_unstable();
+                v.positions.dedup();
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    let mut out: Vec<PathMatch> = map.into_values().collect();
+    util::truncate_to_bottom_n_sorted_by(&mut out, max_results, &|a, b| b.cmp(a));
+    out
 }
 
 /// Compute the distance from a given path to some other path
