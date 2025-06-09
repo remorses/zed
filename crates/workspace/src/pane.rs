@@ -917,13 +917,18 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let item_already_exists = self
-            .items
-            .iter()
-            .any(|existing_item| existing_item.item_id() == item.item_id());
-
-        if !item_already_exists {
-            self.close_items_over_max_tabs(window, cx);
+        let max_tabs = WorkspaceSettings::get_global(cx).max_tabs;
+        while max_tabs != 0 && self.items_len() >= max_tabs {
+            let index_to_remove = self.activation_history.iter().find_map(|entry| {
+                self.items.iter().enumerate().find_map(|(index, item)| {
+                    (!item.is_dirty(cx) && item.item_id() == entry.entity_id).then_some(index)
+                })
+            });
+            if let Some(index_to_remove) = index_to_remove {
+                self.remove_item(index_to_remove, false, true, cx);
+            } else {
+                break; // Could not remove, too many dirty items.
+            }
         }
 
         if item.is_singleton(cx) {
@@ -2924,19 +2929,10 @@ impl Pane {
                             let moved_right = ix > from_ix;
                             let ix = if moved_right { ix - 1 } else { ix };
                             let is_pinned_in_to_pane = this.is_tab_pinned(ix);
-                            let is_at_same_position = ix == from_ix;
 
-                            if is_at_same_position
-                                || (moved_right && is_pinned_in_to_pane)
-                                || (!moved_right && !is_pinned_in_to_pane)
-                                || (!moved_right && was_pinned_in_from_pane)
-                            {
-                                return;
-                            }
-
-                            if is_pinned_in_to_pane {
+                            if !was_pinned_in_from_pane && is_pinned_in_to_pane {
                                 this.pinned_tab_count += 1;
-                            } else {
+                            } else if was_pinned_in_from_pane && !is_pinned_in_to_pane {
                                 this.pinned_tab_count -= 1;
                             }
                         } else if this.items.len() >= to_pane_old_length {
@@ -3876,7 +3872,38 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_allow_pinning_dirty_item_at_max_tabs(cx: &mut TestAppContext) {
+    async fn test_add_item_capped_to_max_tabs(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) = cx.add_window_view(|cx| Workspace::test_new(project.clone(), cx));
+        let pane = workspace.update(cx, |workspace, _| workspace.active_pane().clone());
+
+        for i in 0..8 {
+            add_labeled_item(&pane, format!("{}", i).as_str(), false, cx);
+        }
+        // Remove items to respect the max tab cap.
+        assert_item_labels(&pane, ["3", "4", "5", "6", "7*"], cx);
+        pane.update(cx, |pane, cx| {
+            pane.activate_item(0, false, false, cx);
+        });
+        add_labeled_item(&pane, "X", false, cx);
+        // Respect activation order.
+        assert_item_labels(&pane, ["3", "X*", "5", "6", "7"], cx);
+        for i in 0..7 {
+            add_labeled_item(&pane, format!("D{}", i).as_str(), true, cx);
+        }
+        // Keeps dirty items, even over max tab cap.
+        assert_item_labels(
+            &pane,
+            ["D0^", "D1^", "D2^", "D3^", "D4^", "D5^", "D6*^"],
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_add_item_with_new_item(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
 
@@ -4979,6 +5006,70 @@ mod tests {
 
         // A should be before B and all are pinned
         assert_item_labels(&pane_a, ["A*!", "B!", "C!"], cx);
+    }
+
+    #[gpui::test]
+    async fn test_drag_first_tab_to_last_position(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane_a = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        // Add A, B, C
+        let item_a = add_labeled_item(&pane_a, "A", false, cx);
+        add_labeled_item(&pane_a, "B", false, cx);
+        add_labeled_item(&pane_a, "C", false, cx);
+        assert_item_labels(&pane_a, ["A", "B", "C*"], cx);
+
+        // Move A to the end
+        pane_a.update_in(cx, |pane, window, cx| {
+            let dragged_tab = DraggedTab {
+                pane: pane_a.clone(),
+                item: item_a.boxed_clone(),
+                ix: 0,
+                detail: 0,
+                is_active: true,
+            };
+            pane.handle_tab_drop(&dragged_tab, 2, window, cx);
+        });
+
+        // A should be at the end
+        assert_item_labels(&pane_a, ["B", "C", "A*"], cx);
+    }
+
+    #[gpui::test]
+    async fn test_drag_last_tab_to_first_position(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane_a = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        // Add A, B, C
+        add_labeled_item(&pane_a, "A", false, cx);
+        add_labeled_item(&pane_a, "B", false, cx);
+        let item_c = add_labeled_item(&pane_a, "C", false, cx);
+        assert_item_labels(&pane_a, ["A", "B", "C*"], cx);
+
+        // Move C to the beginning
+        pane_a.update_in(cx, |pane, window, cx| {
+            let dragged_tab = DraggedTab {
+                pane: pane_a.clone(),
+                item: item_c.boxed_clone(),
+                ix: 2,
+                detail: 0,
+                is_active: true,
+            };
+            pane.handle_tab_drop(&dragged_tab, 0, window, cx);
+        });
+
+        // C should be at the beginning
+        assert_item_labels(&pane_a, ["C*", "A", "B"], cx);
     }
 
     #[gpui::test]
