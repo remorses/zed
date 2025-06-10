@@ -262,11 +262,13 @@ impl VariableList {
                 .entry_states
                 .entry(path.clone())
                 .and_modify(|state| {
+                    let depth = path.indices.len().saturating_add(1);
+                    state.depth = depth;
                     state.parent_reference = container_reference;
                     state.has_children = variables_reference != 0;
                 })
-                .or_insert(EntryState {
-                    depth: path.indices.len(),
+                .or_insert_with(|| EntryState {
+                    depth: path.indices.len().saturating_add(1),
                     is_expanded: dap_kind.as_scope().is_some_and(|scope| {
                         (scopes_count == 1 && !contains_local_scope)
                             || scope
@@ -687,7 +689,7 @@ impl VariableList {
         let is_selected = self
             .selection
             .as_ref()
-            .is_some_and(|selection| selection == &entry.path);
+            .is_some_and(|selected_path| selected_path == &entry.path);
 
         let colors = get_entry_color(cx);
         let bg_hover_color = if !is_selected {
