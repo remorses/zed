@@ -3,7 +3,6 @@ mod collab;
 mod onboarding_banner;
 mod platforms;
 mod title_bar_settings;
-mod window_controls;
 
 #[cfg(feature = "stories")]
 mod stories;
@@ -605,6 +604,7 @@ impl TitleBar {
                             .icon(IconName::GitBranch)
                             .icon_position(IconPosition::Start)
                             .icon_color(Color::Muted)
+                            .icon_size(IconSize::Indicator)
                     },
                 ),
         )
