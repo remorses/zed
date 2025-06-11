@@ -467,7 +467,7 @@ impl CompletionSource {
         }
     }
 
-    pub fn lsp_completion(&self, apply_defaults: bool) -> Option<Cow<lsp::CompletionItem>> {
+    pub fn lsp_completion(&self, apply_defaults: bool) -> Option<Cow<'_, lsp::CompletionItem>> {
         if let Self::Lsp {
             lsp_completion,
             lsp_defaults,
@@ -997,6 +997,7 @@ impl Project {
 
             let task_store = cx.new(|cx| {
                 TaskStore::local(
+                    fs.clone(),
                     buffer_store.downgrade(),
                     worktree_store.clone(),
                     toolchain_store.read(cx).as_language_toolchain_store(),
@@ -1136,6 +1137,7 @@ impl Project {
                 .new(|cx| ToolchainStore::remote(SSH_PROJECT_ID, ssh.read(cx).proto_client(), cx));
             let task_store = cx.new(|cx| {
                 TaskStore::remote(
+                    fs.clone(),
                     buffer_store.downgrade(),
                     worktree_store.clone(),
                     toolchain_store.read(cx).as_language_toolchain_store(),
@@ -1396,6 +1398,7 @@ impl Project {
         let task_store = cx.new(|cx| {
             if run_tasks {
                 TaskStore::remote(
+                    fs.clone(),
                     buffer_store.downgrade(),
                     worktree_store.clone(),
                     Arc::new(EmptyToolchainStore),
