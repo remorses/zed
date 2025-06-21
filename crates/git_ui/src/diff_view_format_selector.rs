@@ -1,4 +1,3 @@
-use crate::diff_view::DiffView;
 use editor::{DiffViewFormat, Editor};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, WeakEntity,
@@ -21,29 +20,29 @@ pub fn open(
     let Some((item, _)) = workspace.active_item(cx) else {
         return;
     };
-    let Some(diff_view) = item.act_as::<DiffView>(cx) else {
+    let Some(editor) = item.act_as::<Editor>(cx) else {
         return;
     };
     workspace.toggle_modal(window, cx, |window, cx| {
-        DiffViewFormatSelector::new(diff_view, window, cx)
+        DiffViewFormatSelector::new(editor, window, cx)
     });
 }
 
 pub struct DiffViewFormatSelector {
-    diff_view: Entity<DiffView>,
+    editor: Entity<Editor>,
     picker: Entity<Picker<DiffViewFormatSelectorDelegate>>,
 }
 
 impl DiffViewFormatSelector {
-    fn new(diff_view: Entity<DiffView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let current = diff_view.read(cx).editor.read(cx).diff_view_format();
+    fn new(editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let current = editor.read(cx).diff_view_format();
         let delegate = DiffViewFormatSelectorDelegate::new(
             cx.entity().downgrade(),
-            diff_view.clone(),
+            editor.clone(),
             current,
         );
         let picker = cx.new(|cx| Picker::nonsearchable_uniform_list(delegate, window, cx));
-        Self { diff_view, picker }
+        Self { editor, picker }
     }
 }
 
@@ -64,7 +63,7 @@ impl ModalView for DiffViewFormatSelector {}
 
 struct DiffViewFormatSelectorDelegate {
     selector: WeakEntity<DiffViewFormatSelector>,
-    diff_view: Entity<DiffView>,
+    editor: Entity<Editor>,
     formats: [DiffViewFormat; 3],
     selected_index: usize,
 }
@@ -72,7 +71,7 @@ struct DiffViewFormatSelectorDelegate {
 impl DiffViewFormatSelectorDelegate {
     fn new(
         selector: WeakEntity<DiffViewFormatSelector>,
-        diff_view: Entity<DiffView>,
+        editor: Entity<Editor>,
         current: DiffViewFormat,
     ) -> Self {
         let formats = [
@@ -83,7 +82,7 @@ impl DiffViewFormatSelectorDelegate {
         let selected_index = formats.iter().position(|&f| f == current).unwrap_or(0);
         Self {
             selector,
-            diff_view,
+            editor,
             formats,
             selected_index,
         }
@@ -117,11 +116,8 @@ impl PickerDelegate for DiffViewFormatSelectorDelegate {
 
     fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
         let format = self.formats[self.selected_index];
-        self.diff_view
-            .update(cx, |view, cx| {
-                view.editor
-                    .update(cx, |editor, cx| editor.set_diff_view_format(format, cx));
-            })
+        self.editor
+            .update(cx, |editor, cx| editor.set_diff_view_format(format, cx))
             .ok();
         self.selector
             .update(cx, |_this, cx| cx.emit(DismissEvent))

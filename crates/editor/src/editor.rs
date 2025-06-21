@@ -17787,7 +17787,39 @@ impl Editor {
     }
 
     pub fn set_diff_view_format(&mut self, format: DiffViewFormat, cx: &mut Context<Self>) {
+        if self.diff_view_format == format {
+            return;
+        }
         self.diff_view_format = format;
+
+        let buffers = self.buffer().read(cx).all_buffers();
+        for buffer in buffers {
+            let buffer_id = buffer.read(cx).remote_id();
+            let disk_state = buffer
+                .read(cx)
+                .file()
+                .map(|file| file.disk_state())
+                .unwrap_or(language::DiskState::New);
+
+            match self.diff_view_format {
+                DiffViewFormat::Unified => self.unfold_buffer(buffer_id, cx),
+                DiffViewFormat::AdditionsOnly => {
+                    if disk_state == language::DiskState::Deleted {
+                        self.fold_buffer(buffer_id, cx);
+                    } else {
+                        self.unfold_buffer(buffer_id, cx);
+                    }
+                }
+                DiffViewFormat::DeletionsOnly => {
+                    if disk_state == language::DiskState::New {
+                        self.fold_buffer(buffer_id, cx);
+                    } else {
+                        self.unfold_buffer(buffer_id, cx);
+                    }
+                }
+            }
+        }
+
         cx.notify();
     }
 
