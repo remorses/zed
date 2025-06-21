@@ -1,8 +1,9 @@
-# Debugger (Beta)
+# Debugger
 
-Zed uses the Debug Adapter Protocol (DAP) to provide debugging functionality across multiple programming languages.
+Zed uses the [Debug Adapter Protocol (DAP)](https://microsoft.github.io/debug-adapter-protocol/) to provide debugging functionality across multiple programming languages.
 DAP is a standardized protocol that defines how debuggers, editors, and IDEs communicate with each other.
 It allows Zed to support various debuggers without needing to implement language-specific debugging logic.
+
 This protocol enables features like setting breakpoints, stepping through code, inspecting variables,
 and more, in a consistent manner across different programming languages and runtime environments.
 
@@ -29,6 +30,9 @@ Zed supports a variety of debug adapters for different programming languages out
 
 These adapters enable Zed to provide a consistent debugging experience across multiple languages while leveraging the specific features and capabilities of each debugger.
 
+> Is your desired debugger not listed? You can install a [Debug Adapter extension](https://zed.dev/extensions?filter=debug-adapters) to add support for your favorite debugger.
+> If that's not enough, you can contribute by creating an extension yourself. Check out our [debugger extensions](extensions/debugger-extensions.md) documentation for more information.
+
 ## Getting Started
 
 For basic debugging, you can set up a new configuration by opening the `New Session Modal` either via the `debugger: start` (default: f4) or by clicking the plus icon at the top right of the debug panel.
@@ -42,9 +46,10 @@ You can then use the `New Session Modal` to select a configuration and start deb
 Zed debugger offers two ways to debug your program; you can either _launch_ a new instance of your program or _attach_ to an existing process.
 Which one you choose depends on what you are trying to achieve.
 
-When launching a new instance, Zed (and the underlying debug adapter) can often do a better job at picking up the debug information compared to attaching to an existing process, since it controls the lifetime of a whole program. Running unit tests or a debug build of your application is a good use case for launching.
+When launching a new instance, Zed (and the underlying debug adapter) can often do a better job at picking up the debug information compared to attaching to an existing process, since it controls the lifetime of a whole program.
+Running unit tests or a debug build of your application is a good use case for launching.
 
-Compared to launching, attaching to an existing process might seem inferior, but that's far from truth; there are cases where you cannot afford to restart your program, because e.g. the bug is not reproducible outside of a production environment or some other circumstances.
+Compared to launching, attaching to an existing process might seem inferior, but that's far from truth; there are cases where you cannot afford to restart your program, because for example, the bug is not reproducible outside of a production environment or some other circumstances.
 
 ## Configuration
 
@@ -70,7 +75,7 @@ While configuration fields are debug adapter-dependent, most adapters support th
 ]
 ```
 
-All configuration fields support task variables. See [Tasks Variables](./tasks.md#variables)
+All configuration fields support [task variables](./tasks.md#variables).
 
 ### Build tasks
 
@@ -108,23 +113,9 @@ Build tasks can also refer to the existing tasks by unsubstituted label:
 ### Automatic scenario creation
 
 Given a Zed task, Zed can automatically create a scenario for you. Automatic scenario creation also powers our scenario creation from gutter.
-Automatic scenario creation is currently supported for Rust, Go and Python. Javascript/TypeScript support being worked on.
+Automatic scenario creation is currently supported for Rust, Go, and Python. JavaScript/TypeScript support is being worked on.
 
 ### Example Configurations
-
-#### Go
-
-```json
-[
-  {
-    "label": "Go (Delve)",
-    "adapter": "Delve",
-    "program": "$ZED_FILE",
-    "request": "launch",
-    "mode": "debug"
-  }
-]
-```
 
 #### JavaScript
 
@@ -145,7 +136,7 @@ Automatic scenario creation is currently supported for Rust, Go and Python. Java
 
 ##### Attach debugger to a server running in web browser (`npx serve`)
 
-Given an externally-ran web server (e.g. with `npx serve` or `npx live-server`) one can attach to it and open it with a browser.
+Given an externally-ran web server (e.g., with `npx serve` or `npx live-server`) one can attach to it and open it with a browser.
 
 ```json
 [
@@ -193,7 +184,7 @@ static/
 requirements.txt
 ```
 
-the following configuration can be used:
+…the following configuration can be used:
 
 ```json
 [
@@ -257,12 +248,12 @@ the following configuration can be used:
 
 ##### Attach debugger to a server running in web browser (`npx serve`)
 
-Given an externally-ran web server (e.g. with `npx serve` or `npx live-server`) one can attach to it and open it with a browser.
+Given an externally-ran web server (e.g., with `npx serve` or `npx live-server`) one can attach to it and open it with a browser.
 
 ```json
 [
   {
-    "label": "Launch Chromee (TypeScript)",
+    "label": "Launch Chrome (TypeScript)",
     "adapter": "JavaScript",
     "type": "pwa-chrome",
     "request": "launch",
@@ -280,8 +271,9 @@ Given an externally-ran web server (e.g. with `npx serve` or `npx live-server`) 
 
 #### Go
 
-Zed uses [delve](https://github.com/go-delve/delve?tab=readme-ov-file) to debug Go applications. Zed will automatically create debug scenarios for `func main` in your main packages, and also
-for any tests, so you can use the Play button in the gutter to debug these without configuration. We do not yet support attaching to an existing running copy of delve.
+Zed uses [delve](https://github.com/go-delve/delve?tab=readme-ov-file) to debug Go applications.
+Zed will automatically create debug scenarios for `func main` in your main packages, and also
+for any tests, so you can use the Play button in the gutter to debug these without configuration.
 
 ##### Debug Go Packages
 
@@ -290,11 +282,23 @@ To debug a specific package, you can do so by setting the Delve mode to "debug".
 ```json
 [
   {
+    "label": "Go (Delve)",
+    "adapter": "Delve",
+    "program": "$ZED_FILE",
+    "request": "launch",
+    "mode": "debug"
+  }
+]
+```
+
+```json
+[
+  {
     "label": "Run server",
     "adapter": "Delve",
     "request": "launch",
     "mode": "debug",
-    // For Delve, the program is the package name
+    // For Delve, the program can be a package name
     "program": "./cmd/server"
     // "args": [],
     // "buildFlags": [],
@@ -304,7 +308,8 @@ To debug a specific package, you can do so by setting the Delve mode to "debug".
 
 ##### Debug Go Tests
 
-To debug the tests for a package, set the Delve mode to "test". The "program" is still the package name, and you can use the "buildFlags" to do things like set tags, and the "args" to set args on the test binary. (See `go help testflags` for more information on doing that).
+To debug the tests for a package, set the Delve mode to "test".
+The "program" is still the package name, and you can use the "buildFlags" to do things like set tags, and the "args" to set args on the test binary. (See `go help testflags` for more information on doing that).
 
 ```json
 [
@@ -350,14 +355,35 @@ and the "build" command should build that.
 }
 ```
 
-### Ruby
+##### Attaching to an existing instance of Delve
+
+You might find yourself needing to connect to an existing instance of Delve that's not necessarily running on your machine; in such case, you can use `tcp_arguments` to instrument Zed's connection to Delve.
+
+```
+{
+  "adapter": "Delve",
+  "label": "Connect to a running Delve instance",
+  "program": "/Users/zed/Projects/language_repositories/golang/hello/hello",
+  "cwd": "/Users/zed/Projects/language_repositories/golang/hello",
+  "args": [],
+  "env": {},
+  "request": "launch",
+  "mode": "exec",
+  "stopOnEntry": false,
+  "tcp_connection": { "host": "123.456.789.012", "port": 53412 }
+}
+```
+
+In such case Zed won't spawn a new instance of Delve, as it opts to use an existing one. The consequence of this is that _there will be no terminal_ in Zed; you have to interact with the Delve instance directly, as it handles stdin/stdout of the debuggee.
+
+#### Ruby
 
 To run a ruby task in the debugger, you will need to configure it in the `.zed/debug.json` file in your project. We don't yet have automatic detection of ruby tasks, nor do we support connecting to an existing process.
 
 The configuration should look like this:
 
 ```json
-{
+[
   {
     "adapter": "Ruby",
     "label": "Run CLI",
@@ -370,7 +396,7 @@ The configuration should look like this:
     // "env": {}
     // "cwd": ""
   }
-}
+]
 ```
 
 ## Breakpoints
@@ -551,5 +577,5 @@ The debug adapter will then stop whenever an exception of a given kind occurs. W
 
 The Debugger supports the following theme options:
 
-**debugger.accent**: Color used to accent breakpoint & breakpoint-related symbols
-**editor.debugger_active_line.background**: Background color of active debug line
+- `debugger.accent`: Color used to accent breakpoint & breakpoint-related symbols
+- `editor.debugger_active_line.background`: Background color of active debug line
