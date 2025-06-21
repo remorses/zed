@@ -541,7 +541,7 @@ impl TitleBar {
                 Tooltip::for_action(
                     "Recent Projects",
                     &zed_actions::OpenRecent {
-                        create_new_window: false,
+                        create_new_window: true,
                     },
                     window,
                     cx,
