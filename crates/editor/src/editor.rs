@@ -55,7 +55,7 @@ pub use actions::{AcceptEditPrediction, OpenExcerpts, OpenExcerptsSplit};
 use aho_corasick::AhoCorasick;
 use anyhow::{Context as _, Result, anyhow};
 use blink_manager::BlinkManager;
-use buffer_diff::DiffHunkStatus;
+use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use client::{Collaborator, ParticipantIndex};
 use clock::{AGENT_REPLICA_ID, ReplicaId};
 use collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -335,6 +335,13 @@ enum DisplayDiffHunk {
 pub enum HideMouseCursorOrigin {
     TypingAction,
     MovementAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffViewFormat {
+    Unified,
+    AdditionsOnly,
+    DeletionsOnly,
 }
 
 pub fn init_settings(cx: &mut App) {
@@ -1009,6 +1016,7 @@ pub struct Editor {
     show_line_numbers: Option<bool>,
     use_relative_line_numbers: Option<bool>,
     show_git_diff_gutter: Option<bool>,
+    diff_view_format: DiffViewFormat,
     show_code_actions: Option<bool>,
     show_runnables: Option<bool>,
     show_breakpoints: Option<bool>,
@@ -1161,6 +1169,7 @@ pub struct EditorSnapshot {
     show_gutter: bool,
     show_line_numbers: Option<bool>,
     show_git_diff_gutter: Option<bool>,
+    diff_view_format: DiffViewFormat,
     show_code_actions: Option<bool>,
     show_runnables: Option<bool>,
     show_breakpoints: Option<bool>,
@@ -1976,6 +1985,7 @@ impl Editor {
             use_relative_line_numbers: None,
             disable_expand_excerpt_buttons: false,
             show_git_diff_gutter: None,
+            diff_view_format: DiffViewFormat::Unified,
             show_code_actions: None,
             show_runnables: None,
             show_breakpoints: None,
@@ -2543,6 +2553,7 @@ impl Editor {
             show_gutter: self.show_gutter,
             show_line_numbers: self.show_line_numbers,
             show_git_diff_gutter: self.show_git_diff_gutter,
+            diff_view_format: self.diff_view_format,
             show_code_actions: self.show_code_actions,
             show_runnables: self.show_runnables,
             show_breakpoints: self.show_breakpoints,
@@ -17775,6 +17786,47 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn set_diff_view_format(&mut self, format: DiffViewFormat, cx: &mut Context<Self>) {
+        if self.diff_view_format == format {
+            return;
+        }
+        self.diff_view_format = format;
+
+        let buffers = self.buffer().read(cx).all_buffers();
+        for buffer in buffers {
+            let buffer_id = buffer.read(cx).remote_id();
+            let disk_state = buffer
+                .read(cx)
+                .file()
+                .map(|file| file.disk_state())
+                .unwrap_or(language::DiskState::New);
+
+            match self.diff_view_format {
+                DiffViewFormat::Unified => self.unfold_buffer(buffer_id, cx),
+                DiffViewFormat::AdditionsOnly => {
+                    if disk_state == language::DiskState::Deleted {
+                        self.fold_buffer(buffer_id, cx);
+                    } else {
+                        self.unfold_buffer(buffer_id, cx);
+                    }
+                }
+                DiffViewFormat::DeletionsOnly => {
+                    if disk_state == language::DiskState::New {
+                        self.fold_buffer(buffer_id, cx);
+                    } else {
+                        self.unfold_buffer(buffer_id, cx);
+                    }
+                }
+            }
+        }
+
+        cx.notify();
+    }
+
+    pub fn diff_view_format(&self) -> DiffViewFormat {
+        self.diff_view_format
+    }
+
     pub fn set_show_code_actions(&mut self, show_code_actions: bool, cx: &mut Context<Self>) {
         self.show_code_actions = Some(show_code_actions);
         cx.notify();
@@ -21680,6 +21732,15 @@ impl EditorSnapshot {
             .diff_hunks_in_range(buffer_start..buffer_end)
             .filter_map(|hunk| {
                 if folded_buffers.contains(&hunk.buffer_id) {
+                    return None;
+                }
+
+                let status = hunk.status();
+                if (self.diff_view_format == DiffViewFormat::AdditionsOnly
+                    && status.kind == DiffHunkStatusKind::Deleted)
+                    || (self.diff_view_format == DiffViewFormat::DeletionsOnly
+                        && status.kind == DiffHunkStatusKind::Added)
+                {
                     return None;
                 }
 
