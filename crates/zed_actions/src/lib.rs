@@ -203,6 +203,18 @@ pub mod icon_theme_selector {
     impl_actions!(icon_theme_selector, [Toggle]);
 }
 
+pub mod diff_view_format_selector {
+    use gpui::impl_actions;
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Toggle;
+
+    impl_actions!(diff_view_format_selector, [Toggle]);
+}
+
 pub mod agent {
     use gpui::actions;
 

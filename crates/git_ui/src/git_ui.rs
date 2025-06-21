@@ -23,6 +23,7 @@ pub mod commit_tooltip;
 mod commit_view;
 mod conflict_view;
 pub mod diff_view;
+pub mod diff_view_format_selector;
 pub mod git_panel;
 mod git_panel_settings;
 pub mod onboarding;
@@ -49,6 +50,7 @@ pub fn init(cx: &mut App) {
         git_panel::register(workspace);
         repository_selector::register(workspace);
         branch_picker::register(workspace);
+        diff_view_format_selector::register(workspace);
 
         let project = workspace.project().read(cx);
         if project.is_read_only(cx) {
