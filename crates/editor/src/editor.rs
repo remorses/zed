@@ -55,7 +55,7 @@ pub use actions::{AcceptEditPrediction, OpenExcerpts, OpenExcerptsSplit};
 use aho_corasick::AhoCorasick;
 use anyhow::{Context as _, Result, anyhow};
 use blink_manager::BlinkManager;
-use buffer_diff::DiffHunkStatus;
+use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use client::{Collaborator, ParticipantIndex};
 use clock::{AGENT_REPLICA_ID, ReplicaId};
 use collections::{BTreeMap, HashMap, HashSet, VecDeque};

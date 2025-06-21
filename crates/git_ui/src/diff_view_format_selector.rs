@@ -1,6 +1,7 @@
+use std::sync::Arc;
 use editor::{DiffViewFormat, Editor};
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, WeakEntity,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Task, WeakEntity,
     Window,
 };
 use picker::{Picker, PickerDelegate};
@@ -17,7 +18,7 @@ pub fn open(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let Some((item, _)) = workspace.active_item(cx) else {
+    let Some(item) = workspace.active_item(cx) else {
         return;
     };
     let Some(editor) = item.act_as::<Editor>(cx) else {
@@ -96,6 +97,15 @@ impl PickerDelegate for DiffViewFormatSelectorDelegate {
         "Select Diff View Format".into()
     }
 
+    fn update_matches(
+        &mut self,
+        _query: String,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        Task::ready(())
+    }
+
     fn match_count(&self) -> usize {
         self.formats.len()
     }
@@ -117,8 +127,7 @@ impl PickerDelegate for DiffViewFormatSelectorDelegate {
     fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
         let format = self.formats[self.selected_index];
         self.editor
-            .update(cx, |editor, cx| editor.set_diff_view_format(format, cx))
-            .ok();
+            .update(cx, |editor, cx| editor.set_diff_view_format(format, cx));
         self.selector
             .update(cx, |_this, cx| cx.emit(DismissEvent))
             .ok();
