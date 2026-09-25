@@ -33,6 +33,13 @@ pub trait Styled: Sized {
     gpui_macros::border_style_methods!();
     gpui_macros::box_shadow_style_methods!();
 
+    /// Draw a line outside the border box, like CSS `outline`. Takes no layout
+    /// space. A zero width hides it, for example in a refinement.
+    fn outline(mut self, outline: crate::Outline) -> Self {
+        self.style().outline = Some(outline);
+        self
+    }
+
     /// Sets the display type of the element to `block`.
     /// [Docs](https://tailwindcss.com/docs/display)
     fn block(mut self) -> Self {

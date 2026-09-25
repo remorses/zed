@@ -291,6 +291,10 @@ pub struct Style {
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
+    /// A line drawn outside the border box, like CSS `outline`. It takes no
+    /// layout space, so showing it (for example on focus) moves nothing.
+    pub outline: Option<Outline>,
+
     /// The text style of this element
     #[refineable]
     pub text: TextStyleRefinement,
@@ -342,6 +346,17 @@ pub enum Visibility {
     Visible,
     /// The element should not be drawn, but should still take up space in the layout.
     Hidden,
+}
+
+/// The possible values of the outline property.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Outline {
+    /// Line thickness.
+    pub width: Pixels,
+    /// Line color.
+    pub color: Hsla,
+    /// Gap between the border box and the line. Negative values draw it inside.
+    pub offset: Pixels,
 }
 
 /// The possible values of the box-shadow property
@@ -755,6 +770,35 @@ impl Style {
             ));
         }
 
+        if let Some(outline) = self.outline
+            && outline.width > px(0.)
+            && !outline.color.is_transparent()
+        {
+            // Grow the box by offset + width and paint a border-only quad, so
+            // the line sits outside the element and follows its corners.
+            let grow = outline.offset + outline.width;
+            let outer = bounds.dilate(grow);
+            let grow_corner = |radius: Pixels| {
+                if radius > px(0.) { (radius + grow).max(px(0.)) } else { px(0.) }
+            };
+            let radii = Corners {
+                top_left: grow_corner(corner_radii.top_left),
+                top_right: grow_corner(corner_radii.top_right),
+                bottom_right: grow_corner(corner_radii.bottom_right),
+                bottom_left: grow_corner(corner_radii.bottom_left),
+            };
+            let mut background = outline.color;
+            background.a = 0.;
+            window.paint_quad(quad(
+                outer,
+                radii,
+                background,
+                outline.width,
+                outline.color,
+                BorderStyle::default(),
+            ));
+        }
+
         #[cfg(debug_assertions)]
         if self.debug_below {
             cx.remove_global::<DebugBelow>();
@@ -806,6 +850,7 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
+            outline: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
