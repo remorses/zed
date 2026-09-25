@@ -1725,20 +1725,7 @@ impl Window {
             let mut cx = cx.to_async();
             move |active| {
                 handle
-                    .update(&mut cx, |_, window, cx| {
-                        window.active.set(active);
-                        window.modifiers = window.platform_window.modifiers();
-                        window.capslock = window.platform_window.capslock();
-                        window
-                            .activation_observers
-                            .clone()
-                            .retain(&(), |callback| callback(window, cx));
-
-                        window.bounds_changed(cx);
-                        window.refresh();
-
-                        SystemWindowTabController::update_last_active(cx, window.handle.id);
-                    })
+                    .update(&mut cx, |_, window, cx| window.active_status_changed(active, cx))
                     .log_err();
             }
         }));
@@ -6353,6 +6340,27 @@ impl Window {
     pub fn set_a11y_active_for_tests(&mut self, active: bool) {
         self.a11y.set_active_for_tests(active);
         self.refresh();
+    }
+
+    /// Report the window as active without asking the platform to activate it.
+    /// An offscreen test window is never key, so focus and blur listeners
+    /// never fire; activating it for real would take the user's keyboard.
+    pub fn set_active_for_tests(&mut self, active: bool, cx: &mut App) {
+        self.active_status_changed(active, cx);
+    }
+
+    fn active_status_changed(&mut self, active: bool, cx: &mut App) {
+        self.active.set(active);
+        self.modifiers = self.platform_window.modifiers();
+        self.capslock = self.platform_window.capslock();
+        self.activation_observers
+            .clone()
+            .retain(&(), |callback| callback(self, cx));
+
+        self.bounds_changed(cx);
+        self.refresh();
+
+        SystemWindowTabController::update_last_active(cx, self.handle.id);
     }
 
     /// Register a listener for an accessibility action on a specific node.
