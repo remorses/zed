@@ -30,6 +30,7 @@ struct NodeContext {
 }
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
+    measured_nodes: Vec<NodeId>,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
@@ -45,6 +46,7 @@ impl TaffyLayoutEngine {
         taffy.disable_rounding();
         TaffyLayoutEngine {
             taffy,
+            measured_nodes: Vec::new(),
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
@@ -53,6 +55,15 @@ impl TaffyLayoutEngine {
     }
 
     pub fn clear(&mut self) {
+        // Taffy 0.13's clear() strands node contexts, retaining measure
+        // closures and captured entities after a subtree disappears. Use its
+        // context-removal API while node ids are still valid. Remove this when
+        // upgrading past https://github.com/DioxusLabs/taffy/pull/1181.
+        for node in self.measured_nodes.drain(..) {
+            self.taffy
+                .set_node_context(node, None)
+                .expect(EXPECT_MESSAGE);
+        }
         self.taffy.clear();
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
@@ -100,10 +111,12 @@ impl TaffyLayoutEngine {
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
 
-        self.taffy
+        let node = self
+            .taffy
             .new_leaf_with_context(taffy_style, NodeContext { measure })
-            .expect(EXPECT_MESSAGE)
-            .into()
+            .expect(EXPECT_MESSAGE);
+        self.measured_nodes.push(node);
+        node.into()
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -745,6 +758,33 @@ impl From<Size<Pixels>> for Size<AvailableSpace> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_releases_measured_contexts() {
+        let mut engine = TaffyLayoutEngine::new();
+        for count in [8, 1, 0] {
+            let mut captures = Vec::new();
+            for _ in 0..count {
+                let capture = std::rc::Rc::new(());
+                captures.push(std::rc::Rc::downgrade(&capture));
+                engine.request_measured_layout(
+                    Style::default(),
+                    Pixels(16.0),
+                    1.0,
+                    move |_, _, _, _| {
+                        let _ = &capture;
+                        Size::default()
+                    },
+                );
+            }
+            assert!(captures.iter().all(|capture| capture.upgrade().is_some()));
+            engine.clear();
+            assert!(
+                captures.iter().all(|capture| capture.upgrade().is_none()),
+                "clear must drop every measurement closure"
+            );
+        }
+    }
 
     #[test]
     fn border_widths_to_taffy_use_stroke_snapping() {
