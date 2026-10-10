@@ -296,6 +296,8 @@ struct ListItemSummary {
     rendered_count: usize,
     unrendered_count: usize,
     height: Pixels,
+    /// The part of `height` that rows measured themselves, without the hints of the rest.
+    measured_height: Pixels,
     has_focus_handles: bool,
     has_unknown_height: bool,
 }
@@ -801,6 +803,35 @@ impl ListState {
         let offset = summary.height + logical_scroll_top.offset_in_item;
 
         Point::new(px(0.), -offset)
+    }
+
+    /// How far the list can scroll and how far it has, for a scrollbar, with rows that
+    /// are not measured yet taken to be as tall as the average measured row rather than as
+    /// tall as their size hint. A hint is one guess for every row; a thread of tall rows
+    /// with a short hint would otherwise draw a thumb several times too long, and move it as
+    /// rows come into view. `None` until a row is measured. Both values are zero or positive;
+    /// `offset` is how far the content has moved up.
+    pub fn averaged_scroll_extent(&self) -> Option<(Pixels, Pixels)> {
+        let state = self.0.borrow();
+        let summary = state.items.summary();
+        if summary.rendered_count == 0 {
+            return None;
+        }
+        let average = summary.measured_height / summary.rendered_count as f32;
+        let total = summary.measured_height + average * summary.unrendered_count as f32;
+        let viewport = state.last_layout_bounds.unwrap_or_default().size.height;
+        let max = (total - viewport).max(px(0.));
+        let offset = if state.logical_scroll_top.is_none()
+            && state.alignment == ListAlignment::Bottom
+        {
+            max
+        } else {
+            let top = state.logical_scroll_top();
+            let mut cursor = state.items.cursor::<ListItemSummary>(());
+            let before: ListItemSummary = cursor.summary(&Count(top.item_ix), Bias::Right);
+            before.measured_height + average * before.unrendered_count as f32 + top.offset_in_item
+        };
+        Some((max, offset.min(max)))
     }
 
     /// Return the bounds of the viewport in pixels.
@@ -1703,6 +1734,7 @@ impl sum_tree::Item for ListItem {
                 } else {
                     px(0.)
                 },
+                measured_height: px(0.),
                 has_focus_handles: focus_handle.is_some(),
                 has_unknown_height: size_hint.is_none(),
             },
@@ -1713,6 +1745,7 @@ impl sum_tree::Item for ListItem {
                 rendered_count: 1,
                 unrendered_count: 0,
                 height: size.height,
+                measured_height: size.height,
                 has_focus_handles: focus_handle.is_some(),
                 has_unknown_height: false,
             },
@@ -1730,6 +1763,7 @@ impl sum_tree::ContextLessSummary for ListItemSummary {
         self.rendered_count += summary.rendered_count;
         self.unrendered_count += summary.unrendered_count;
         self.height += summary.height;
+        self.measured_height += summary.measured_height;
         self.has_focus_handles |= summary.has_focus_handles;
         self.has_unknown_height |= summary.has_unknown_height;
     }
