@@ -807,7 +807,7 @@ impl ListState {
 
     /// How far the list can scroll and how far it has, for a scrollbar, with rows that
     /// are not measured yet taken to be as tall as the average measured row rather than as
-    /// tall as their size hint. A hint is one guess for every row; a thread of tall rows
+    /// tall as their size hint. A hint is one guess for every row; a list of tall rows
     /// with a short hint would otherwise draw a thumb several times too long, and move it as
     /// rows come into view. `None` until a row is measured. Both values are zero or positive;
     /// `offset` is how far the content has moved up.
