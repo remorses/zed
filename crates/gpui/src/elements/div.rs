@@ -4661,6 +4661,69 @@ mod tests {
         );
     }
 
+    struct HoverProbeView {
+        hovered: Rc<Cell<bool>>,
+    }
+
+    impl Render for HoverProbeView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let hovered = self.hovered.clone();
+            div().size_full().child(
+                canvas(
+                    |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                    move |_, hitbox, window, _| hovered.set(hitbox.is_hovered(window)),
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn pointer_leaving_the_window_hovers_nothing(cx: &mut TestAppContext) {
+        let hovered = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let hovered = hovered.clone();
+            move |_, _| HoverProbeView { hovered }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        let inside = point(px(5.), px(5.));
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap()
+        };
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(inside, cx);
+        })
+        .unwrap();
+        draw(cx);
+        assert!(hovered.get(), "the pointer is over the element");
+
+        // The platform sends no final move: the last position inside stays put.
+        cx.update_window(any_window, |_, window, cx| {
+            window.dispatch_event(
+                MouseExitEvent {
+                    position: inside,
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        draw(cx);
+        assert!(!hovered.get(), "an exited pointer hovers nothing");
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.simulate_mouse_move(inside, cx);
+        })
+        .unwrap();
+        draw(cx);
+        assert!(hovered.get(), "moving back in hovers again");
+    }
+
     struct TestTooltipView;
 
     impl Render for TestTooltipView {

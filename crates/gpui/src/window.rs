@@ -1183,6 +1183,10 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    /// The platform reported the pointer leaving the window and it has not moved
+    /// back. `mouse_position` is then the last place it was inside, which would
+    /// keep that element hovered, so nothing is hit while this is set.
+    pointer_outside: bool,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -1867,6 +1871,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            pointer_outside: false,
             modifiers,
             capslock,
             scale_factor,
@@ -3228,7 +3233,11 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        self.mouse_hit_test = if self.pointer_outside {
+            HitTest::default()
+        } else {
+            self.next_frame.hit_test(self.mouse_position)
+        };
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
@@ -5353,6 +5362,22 @@ impl Window {
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
 
+        match &event {
+            PlatformInput::MouseExited(_) => {
+                self.pointer_outside = true;
+                // Hover styles are read at paint, and nothing else repaints for an exit.
+                if !self.mouse_hit_test.ids.is_empty() {
+                    self.refresh();
+                }
+            }
+            PlatformInput::MouseMove(_)
+            | PlatformInput::MouseDown(_)
+            | PlatformInput::MouseUp(_)
+            | PlatformInput::ScrollWheel(_)
+            | PlatformInput::Pinch(_) => self.pointer_outside = false,
+            _ => {}
+        }
+
         if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
@@ -5407,7 +5432,11 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = if self.pointer_outside {
+            HitTest::default()
+        } else {
+            self.rendered_frame.hit_test(self.mouse_position())
+        };
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);

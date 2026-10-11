@@ -225,6 +225,11 @@ pub enum ListHorizontalSizingBehavior {
     Unconstrained,
 }
 
+/// The width rows get inside a list of `width` with `padding`.
+fn padded_width(width: Pixels, padding: &Edges<Pixels>) -> Pixels {
+    (width - padding.left - padding.right).max(px(0.))
+}
+
 struct LayoutItemsResponse {
     max_item_width: Pixels,
     scroll_top: ListOffset,
@@ -296,6 +301,8 @@ struct ListItemSummary {
     rendered_count: usize,
     unrendered_count: usize,
     height: Pixels,
+    /// The part of `height` that rows measured themselves, without the hints of the rest.
+    measured_height: Pixels,
     has_focus_handles: bool,
     has_unknown_height: bool,
 }
@@ -803,6 +810,35 @@ impl ListState {
         Point::new(px(0.), -offset)
     }
 
+    /// How far the list can scroll and how far it has, for a scrollbar, with rows that
+    /// are not measured yet taken to be as tall as the average measured row rather than as
+    /// tall as their size hint. A hint is one guess for every row; a list of tall rows
+    /// with a short hint would otherwise draw a thumb several times too long, and move it as
+    /// rows come into view. `None` until a row is measured. Both values are zero or positive;
+    /// `offset` is how far the content has moved up.
+    pub fn averaged_scroll_extent(&self) -> Option<(Pixels, Pixels)> {
+        let state = self.0.borrow();
+        let summary = state.items.summary();
+        if summary.rendered_count == 0 {
+            return None;
+        }
+        let average = summary.measured_height / summary.rendered_count as f32;
+        let total = summary.measured_height + average * summary.unrendered_count as f32;
+        let viewport = state.last_layout_bounds.unwrap_or_default().size.height;
+        let max = (total - viewport).max(px(0.));
+        let offset = if state.logical_scroll_top.is_none()
+            && state.alignment == ListAlignment::Bottom
+        {
+            max
+        } else {
+            let top = state.logical_scroll_top();
+            let mut cursor = state.items.cursor::<ListItemSummary>(());
+            let before: ListItemSummary = cursor.summary(&Count(top.item_ix), Bias::Right);
+            before.measured_height + average * before.unrendered_count as f32 + top.offset_in_item
+        };
+        Some((max, offset.min(max)))
+    }
+
     /// Return the bounds of the viewport in pixels.
     pub fn viewport_bounds(&self) -> Bounds<Pixels> {
         self.0.borrow().last_layout_bounds.unwrap_or_default()
@@ -1288,16 +1324,18 @@ impl StateInner {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<LayoutItemsResponse, ListOffset> {
+        // Rows are as wide as the list is inside its left and right padding.
+        let content_width = padded_width(bounds.size.width, &padding);
         window.transact(|window| {
             match self.measuring_behavior {
                 ListMeasuringBehavior::Measure(has_measured) if !has_measured => {
-                    self.layout_all_items(bounds.size.width, render_item, window, cx);
+                    self.layout_all_items(content_width, render_item, window, cx);
                 }
                 _ => {}
             }
 
             let mut layout_response = self.layout_items(
-                Some(bounds.size.width),
+                Some(content_width),
                 bounds.size.height,
                 &padding,
                 render_item,
@@ -1310,7 +1348,7 @@ impl StateInner {
 
             // Only paint the visible items, if there is actually any space for them (taking padding into account)
             if bounds.size.height > padding.top + padding.bottom {
-                let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
+                let mut item_origin = bounds.origin + Point::new(padding.left, padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
                 for item in &mut layout_response.item_layouts {
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
@@ -1339,10 +1377,8 @@ impl StateInner {
                                     };
                                     let size = prev_item.size().unwrap_or_else(|| {
                                         let mut element = render_item(cursor.start().0, window, cx);
-                                        let item_available_size = size(
-                                            bounds.size.width.into(),
-                                            AvailableSpace::MinContent,
-                                        );
+                                        let item_available_size =
+                                            size(content_width.into(), AvailableSpace::MinContent);
                                         element.layout_as_root(item_available_size, window, cx)
                                     });
                                     item_ix = cursor.start().0;
@@ -1370,7 +1406,7 @@ impl StateInner {
                                 let size = item.size().unwrap_or_else(|| {
                                     let mut item = render_item(cursor.start().0, window, cx);
                                     let item_available_size =
-                                        size(bounds.size.width.into(), AvailableSpace::MinContent);
+                                        size(content_width.into(), AvailableSpace::MinContent);
                                     item.layout_as_root(item_available_size, window, cx)
                                 });
                                 height -= size.height;
@@ -1581,13 +1617,20 @@ impl Element for List {
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
-        // Width change can alter wrapped heights. Keep the last size as a hint
-        // so off-screen rows do not collapse to 0. First layout must not wipe
+        let padding = style
+            .padding
+            .to_pixels(bounds.size.into(), window.rem_size());
+
+        // A change in the width rows get, from the list's own width or its
+        // horizontal padding, can alter wrapped heights. Keep the last size as a
+        // hint so off-screen rows do not collapse to 0. First layout must not wipe
         // with_uniform_item_height hints.
-        if state
-            .last_layout_bounds
-            .is_some_and(|last_bounds| last_bounds.size.width != bounds.size.width)
-        {
+        if state.last_layout_bounds.is_some_and(|last_bounds| {
+            padded_width(
+                last_bounds.size.width,
+                &state.last_padding.unwrap_or_default(),
+            ) != padded_width(bounds.size.width, &padding)
+        }) {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
                     size_hint: item.size().or(item.size_hint()),
@@ -1600,9 +1643,6 @@ impl Element for List {
             state.measuring_behavior.reset();
         }
 
-        let padding = style
-            .padding
-            .to_pixels(bounds.size.into(), window.rem_size());
         let layout =
             match state.prepaint_items(bounds, padding, true, &mut self.render_item, window, cx) {
                 Ok(layout) => layout,
@@ -1703,6 +1743,7 @@ impl sum_tree::Item for ListItem {
                 } else {
                     px(0.)
                 },
+                measured_height: px(0.),
                 has_focus_handles: focus_handle.is_some(),
                 has_unknown_height: size_hint.is_none(),
             },
@@ -1713,6 +1754,7 @@ impl sum_tree::Item for ListItem {
                 rendered_count: 1,
                 unrendered_count: 0,
                 height: size.height,
+                measured_height: size.height,
                 has_focus_handles: focus_handle.is_some(),
                 has_unknown_height: false,
             },
@@ -1730,6 +1772,7 @@ impl sum_tree::ContextLessSummary for ListItemSummary {
         self.rendered_count += summary.rendered_count;
         self.unrendered_count += summary.unrendered_count;
         self.height += summary.height;
+        self.measured_height += summary.measured_height;
         self.has_focus_handles |= summary.has_focus_handles;
         self.has_unknown_height |= summary.has_unknown_height;
     }
