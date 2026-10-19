@@ -1554,6 +1554,189 @@ impl WgpuRenderer {
         Ok(())
     }
 
+    /// Render `scene` into an offscreen wgpu texture and read the pixels back as
+    /// an `image::RgbaImage`, without presenting. This is the Linux/FreeBSD
+    /// analogue of the macOS Metal and Windows DirectX `render_to_image` paths:
+    /// it reuses `record_frame` to encode the scene into a fresh offscreen
+    /// render target, then copies that target into a CPU-readable buffer and
+    /// maps it back to the CPU.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn render_to_image(&mut self, scene: &Scene) -> Result<image::RgbaImage> {
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let format = self.surface_config.format;
+        let (device, queue) = {
+            let resources = self.resources();
+            (resources.device.clone(), resources.queue.clone())
+        };
+
+        // Offscreen render target matching the surface size and format, so the
+        // scene's pipelines (built for the surface format) can bind it.
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gpuix render_to_image target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            // COPY_SRC is required for the copy_texture_to_buffer readback below;
+            // without it the copy is a validation error and the buffer reads back zeros.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Write the globals buffer exactly as `draw` does, so the render is
+        // self-contained and does not depend on a prior on-screen frame.
+        let gamma_params = GammaParams {
+            gamma_ratios: self.rendering_params.gamma_ratios,
+            grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
+            subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
+            is_bgr: self.is_bgr as u32,
+            _pad: 0,
+        };
+        let globals = GlobalParams {
+            viewport_size: [width as f32, height as f32],
+            premultiplied_alpha: if self.surface_config.alpha_mode
+                == wgpu::CompositeAlphaMode::PreMultiplied
+            {
+                1
+            } else {
+                0
+            },
+            pad: 0,
+        };
+        let path_globals = GlobalParams {
+            premultiplied_alpha: 0,
+            ..globals
+        };
+        {
+            let resources = self.resources();
+            resources
+                .queue
+                .write_buffer(&resources.globals_buffer, 0, bytemuck::bytes_of(&globals));
+            resources.queue.write_buffer(
+                &resources.globals_buffer,
+                self.path_globals_offset,
+                bytemuck::bytes_of(&path_globals),
+            );
+            resources.queue.write_buffer(
+                &resources.globals_buffer,
+                self.gamma_offset,
+                bytemuck::bytes_of(&gamma_params),
+            );
+        }
+
+        // Flush pending glyph-atlas uploads, exactly as `draw` does before
+        // presenting. Without this the offscreen render samples an atlas whose
+        // glyphs have not reached the GPU yet, and all text is invisible.
+        self.atlas.before_frame();
+
+        // Encode the scene into the offscreen target and submit, as `draw` does.
+        self.ensure_intermediate_textures();
+        self.record_frame(scene, &view)
+            .with_context(|| "rendering the scene into the offscreen render target")?;
+        drop(view);
+
+        // CPU-readable staging buffer. wgpu requires `bytes_per_row` to be a
+        // multiple of COPY_BYTES_PER_ROW_ALIGNMENT for a multi-row copy (a
+        // `None` layout is a validation error that makes the copy a no-op and
+        // the buffer read back all zeros), so the staging buffer is padded per
+        // row and the padding is stripped after the readback.
+        let unpadded_bytes_per_row = u64::from(width) * 4;
+        let row_alignment = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(row_alignment) * row_alignment;
+        let size = padded_bytes_per_row * u64::from(height);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpuix render_to_image readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpuix render_to_image readback"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row as u32),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+
+        // Map the buffer, polling the device until the copy has landed.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_map = std::sync::Arc::clone(&done);
+        buffer.map_async(
+            wgpu::MapMode::Read,
+            0..size,
+            move |result| {
+                if result.is_err() {
+                    log::error!("render_to_image readback map failed: {result:?}");
+                }
+                done_map.store(true, std::sync::atomic::Ordering::Relaxed);
+            },
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+            match device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(50)),
+            }) {
+                Ok(_) => {}
+                Err(wgpu::PollError::Timeout) => {}
+                Err(e) => return Err(anyhow::anyhow!("wgpu device poll failed: {e}")),
+            }
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!("timed out waiting for the wgpu readback map to complete");
+            }
+        }
+
+        let mapped: Vec<u8> = buffer.get_mapped_range(0..size).to_vec();
+        buffer.unmap();
+
+        // Strip the per-row padding the copy layout required, then swap the red
+        // and blue channels for any BGRA format (image::RgbaImage wants RGBA).
+        let swizzle_bgra = matches!(
+            format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let mut pixels: Vec<u8> = Vec::with_capacity((unpadded_bytes_per_row * u64::from(height)) as usize);
+        for row in mapped.chunks_exact(padded_bytes_per_row as usize) {
+            for px in row[..unpadded_bytes_per_row as usize].chunks_exact(4) {
+                if swizzle_bgra {
+                    pixels.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                } else {
+                    pixels.extend_from_slice(px);
+                }
+            }
+        }
+
+        image::RgbaImage::from_raw(width, height, pixels)
+            .context("building the RgbaImage from the wgpu readback")
+    }
+
     // Ported from gpui-ce #39 / #121: sample an RGBA wgpu texture in the scene.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn draw_surfaces(&self, surfaces: &[gpui::PaintSurface], pass: &mut wgpu::RenderPass<'_>) {

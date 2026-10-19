@@ -16,7 +16,7 @@ mod threaded_dispatcher;
 mod test;
 
 #[cfg(all(
-    any(target_os = "macos", target_os = "windows"),
+    not(all(target_arch = "wasm32", target_os = "unknown")),
     any(test, feature = "test-support")
 ))]
 mod visual_test;
@@ -91,7 +91,7 @@ pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream}
 pub use threaded_dispatcher::ThreadedDispatcher;
 
 #[cfg(all(
-    any(target_os = "macos", target_os = "windows"),
+    not(all(target_arch = "wasm32", target_os = "unknown")),
     any(test, feature = "test-support")
 ))]
 pub use visual_test::VisualTestPlatform;

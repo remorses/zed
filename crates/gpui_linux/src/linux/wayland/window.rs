@@ -1942,6 +1942,12 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        let mut state = self.borrow_mut();
+        state.renderer.render_to_image(scene)
+    }
+
     fn schedule_frame(&self) {
         self.0.schedule_frame();
     }

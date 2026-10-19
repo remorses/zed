@@ -39,7 +39,7 @@ pub use test_app::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_context::*;
 #[cfg(all(
-    any(target_os = "macos", target_os = "windows"),
+    not(all(target_arch = "wasm32", target_os = "unknown")),
     any(test, feature = "test-support")
 ))]
 pub use visual_test_context::*;
@@ -74,7 +74,7 @@ mod test_app;
 #[cfg(any(test, feature = "test-support"))]
 mod test_context;
 #[cfg(all(
-    any(target_os = "macos", target_os = "windows"),
+    not(all(target_arch = "wasm32", target_os = "unknown")),
     any(test, feature = "test-support")
 ))]
 mod visual_test_context;
