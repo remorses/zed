@@ -322,12 +322,11 @@ fn install_restore_hooks() {
 const SIGNAL_RESIZE: u8 = b'w';
 const SIGNAL_QUIT: u8 = b'q';
 
-const HANDLED_SIGNALS: [libc::c_int; 4] =
-    [libc::SIGWINCH, libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
-
-/// Handlers that were installed before ours, e.g. Node's libuv handlers when
-/// GPUI is embedded. They keep running so the host still sees its signals.
-static PREVIOUS_ACTIONS: OnceLock<Vec<(libc::c_int, libc::sigaction)>> = OnceLock::new();
+/// The SIGWINCH handler installed before ours, e.g. Node's libuv one when GPUI
+/// is embedded. It keeps running so the host still sees resizes. Quit signals
+/// are not forwarded: a host handler may exit on the spot, before the terminal
+/// is restored. Quitting the app restores it, then the host exits.
+static PREVIOUS_RESIZE_ACTION: OnceLock<libc::sigaction> = OnceLock::new();
 
 extern "C" fn on_signal(
     signal: libc::c_int,
@@ -345,14 +344,13 @@ extern "C" fn on_signal(
         unsafe { libc::write(fd, &byte as *const u8 as *const libc::c_void, 1) };
     }
 
-    let Some((_, previous)) = PREVIOUS_ACTIONS
-        .get()
-        .and_then(|actions| actions.iter().find(|(handled, _)| *handled == signal))
-    else {
+    if signal != libc::SIGWINCH {
+        return;
+    }
+    let Some(previous) = PREVIOUS_RESIZE_ACTION.get() else {
         return;
     };
     let handler = previous.sa_sigaction;
-    // SIG_DFL would terminate without restoring the terminal; quitting does it.
     if handler == libc::SIG_DFL || handler == libc::SIG_IGN {
         return;
     }
@@ -377,22 +375,17 @@ fn install_signal_pipe() -> Result<RawFd> {
         libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
     }
     SIGNAL_PIPE_WRITE.store(fds[1], Ordering::Relaxed);
-    PREVIOUS_ACTIONS.get_or_init(|| {
-        HANDLED_SIGNALS
-            .into_iter()
-            .map(|signal| {
-                let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
-                let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
-                action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
-                action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
-                unsafe {
-                    libc::sigemptyset(&mut action.sa_mask);
-                    libc::sigaction(signal, &action, &mut previous);
-                }
-                (signal, previous)
-            })
-            .collect()
-    });
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
+    action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    for signal in [libc::SIGWINCH, libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        unsafe { libc::sigaction(signal, &action, &mut previous) };
+        if signal == libc::SIGWINCH {
+            PREVIOUS_RESIZE_ACTION.get_or_init(|| previous);
+        }
+    }
     Ok(fds[0])
 }
 
