@@ -95,7 +95,6 @@ members = [
     "crates/gpui_macros",
     "crates/gpui_platform",
     "crates/gpui_shared_string",
-    "crates/gpui_terminal",
     "crates/gpui_tokio",
     "crates/gpui_util",
     "crates/gpui_web",
@@ -362,7 +361,6 @@ gpui_macos = { path = "crates/gpui_macos", default-features = false }
 gpui_macros = { path = "crates/gpui_macros" }
 gpui_platform = { path = "crates/gpui_platform", default-features = false }
 gpui_shared_string = { path = "crates/gpui_shared_string" }
-gpui_terminal = { path = "crates/gpui_terminal" }
 gpui_tokio = { path = "crates/gpui_tokio" }
 gpui_util = { path = "crates/gpui_util" }
 gpui_web = { path = "crates/gpui_web" }
