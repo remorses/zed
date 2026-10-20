@@ -9,7 +9,6 @@ use std::{
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicI32, Ordering},
-        mpsc,
     },
     thread,
     time::Duration,
@@ -18,7 +17,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use gpui::{Keystroke, Modifiers, MouseButton, NavigationDirection};
 
-use crate::dispatcher::MainMessage;
+use crate::dispatcher::{MainMessage, MainSender};
 
 /// Kitty keyboard flags: disambiguate (1), report event types (2), report
 /// alternate keys (4), report all keys as escape codes (8), report associated
@@ -109,6 +108,92 @@ pub(crate) enum TerminalEvent {
 struct Restore {
     fd: RawFd,
     original: libc::termios,
+    captured: Option<CapturedOutput>,
+}
+
+/// stdout and stderr, when they are this terminal, go to an unlinked temp file
+/// while the app runs. Any print would otherwise scroll the alternate screen
+/// and the frame with it. The file is replayed after the terminal is restored.
+struct CapturedOutput {
+    file: RawFd,
+    /// `(redirected fd, dup of the original)`.
+    saved: Vec<(RawFd, RawFd)>,
+}
+
+impl CapturedOutput {
+    fn start() -> Option<Self> {
+        let targets: Vec<RawFd> = [libc::STDOUT_FILENO, libc::STDERR_FILENO]
+            .into_iter()
+            .filter(|fd| unsafe { libc::isatty(*fd) } == 1)
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        let directory = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_owned());
+        let template = format!(
+            "{}/gpui-terminal-output.XXXXXX",
+            directory.trim_end_matches('/')
+        );
+        let mut template = std::ffi::CString::new(template).ok()?.into_bytes_with_nul();
+        let file = unsafe { libc::mkstemp(template.as_mut_ptr() as *mut libc::c_char) };
+        if file < 0 {
+            log::error!(
+                "cannot capture terminal output: {}",
+                io::Error::last_os_error()
+            );
+            return None;
+        }
+        unsafe { libc::unlink(template.as_ptr() as *const libc::c_char) };
+        let saved = targets
+            .into_iter()
+            .filter_map(|target| {
+                let original = unsafe { libc::dup(target) };
+                if original < 0 || unsafe { libc::dup2(file, target) } < 0 {
+                    return None;
+                }
+                Some((target, original))
+            })
+            .collect();
+        Some(Self { file, saved })
+    }
+
+    fn finish(self) {
+        for (target, original) in &self.saved {
+            unsafe {
+                libc::dup2(*original, *target);
+                libc::close(*original);
+            }
+        }
+        let mut buffer = [0u8; 16 * 1024];
+        unsafe { libc::lseek(self.file, 0, libc::SEEK_SET) };
+        loop {
+            let count = unsafe {
+                libc::read(
+                    self.file,
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    buffer.len(),
+                )
+            };
+            if count <= 0 {
+                break;
+            }
+            let mut written = 0;
+            while written < count as usize {
+                let result = unsafe {
+                    libc::write(
+                        libc::STDERR_FILENO,
+                        buffer[written..].as_ptr() as *const libc::c_void,
+                        count as usize - written,
+                    )
+                };
+                if result <= 0 {
+                    break;
+                }
+                written += result as usize;
+            }
+        }
+        unsafe { libc::close(self.file) };
+    }
 }
 
 /// Kept global so the panic hook and signal path can put the terminal back
@@ -139,8 +224,12 @@ impl Tty {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error()).context("tcsetattr failed");
         }
-        *RESTORE.lock().unwrap_or_else(|error| error.into_inner()) = Some(Restore { fd, original });
-        install_panic_hook();
+        *RESTORE.lock().unwrap_or_else(|error| error.into_inner()) = Some(Restore {
+            fd,
+            original,
+            captured: CapturedOutput::start(),
+        });
+        install_restore_hooks();
 
         let mut tty = Self { file };
         tty.write_all(enter_sequence().as_bytes())?;
@@ -166,7 +255,7 @@ impl Tty {
         })
     }
 
-    pub(crate) fn spawn_input_thread(&self, sender: mpsc::Sender<MainMessage>) -> Result<()> {
+    pub(crate) fn spawn_input_thread(&self, sender: MainSender) -> Result<()> {
         let reader = self
             .file
             .try_clone()
@@ -207,9 +296,18 @@ pub(crate) fn restore_terminal() {
         );
         libc::tcsetattr(restore.fd, libc::TCSANOW, &restore.original);
     }
+    if let Some(captured) = restore.captured {
+        captured.finish();
+    }
 }
 
-fn install_panic_hook() {
+extern "C" fn restore_terminal_at_exit() {
+    restore_terminal();
+}
+
+/// Panics, and `exit(3)` without unwinding (Node's `process.exit`), must still
+/// leave raw mode and the alternate screen.
+fn install_restore_hooks() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
         let previous = std::panic::take_hook();
@@ -217,24 +315,57 @@ fn install_panic_hook() {
             restore_terminal();
             previous(info);
         }));
+        unsafe { libc::atexit(restore_terminal_at_exit) };
     });
 }
 
 const SIGNAL_RESIZE: u8 = b'w';
 const SIGNAL_QUIT: u8 = b'q';
 
-extern "C" fn on_signal(signal: libc::c_int) {
+const HANDLED_SIGNALS: [libc::c_int; 4] =
+    [libc::SIGWINCH, libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
+
+/// Handlers that were installed before ours, e.g. Node's libuv handlers when
+/// GPUI is embedded. They keep running so the host still sees its signals.
+static PREVIOUS_ACTIONS: OnceLock<Vec<(libc::c_int, libc::sigaction)>> = OnceLock::new();
+
+extern "C" fn on_signal(
+    signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
     let fd = SIGNAL_PIPE_WRITE.load(Ordering::Relaxed);
-    if fd < 0 {
+    if fd >= 0 {
+        let byte = if signal == libc::SIGWINCH {
+            SIGNAL_RESIZE
+        } else {
+            SIGNAL_QUIT
+        };
+        // write(2) is async-signal-safe; a full pipe already holds a pending wake.
+        unsafe { libc::write(fd, &byte as *const u8 as *const libc::c_void, 1) };
+    }
+
+    let Some((_, previous)) = PREVIOUS_ACTIONS
+        .get()
+        .and_then(|actions| actions.iter().find(|(handled, _)| *handled == signal))
+    else {
+        return;
+    };
+    let handler = previous.sa_sigaction;
+    // SIG_DFL would terminate without restoring the terminal; quitting does it.
+    if handler == libc::SIG_DFL || handler == libc::SIG_IGN {
         return;
     }
-    let byte = if signal == libc::SIGWINCH {
-        SIGNAL_RESIZE
-    } else {
-        SIGNAL_QUIT
-    };
-    // write(2) is async-signal-safe; a full pipe already holds a pending wake.
-    unsafe { libc::write(fd, &byte as *const u8 as *const libc::c_void, 1) };
+    unsafe {
+        if previous.sa_flags & libc::SA_SIGINFO != 0 {
+            let handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+                std::mem::transmute(handler);
+            handler(signal, info, context);
+        } else {
+            let handler: extern "C" fn(libc::c_int) = std::mem::transmute(handler);
+            handler(signal);
+        }
+    }
 }
 
 fn install_signal_pipe() -> Result<RawFd> {
@@ -246,17 +377,26 @@ fn install_signal_pipe() -> Result<RawFd> {
         libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
     }
     SIGNAL_PIPE_WRITE.store(fds[1], Ordering::Relaxed);
-    for signal in [libc::SIGWINCH, libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
-        unsafe { libc::signal(signal, on_signal as *const () as libc::sighandler_t) };
-    }
+    PREVIOUS_ACTIONS.get_or_init(|| {
+        HANDLED_SIGNALS
+            .into_iter()
+            .map(|signal| {
+                let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+                let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
+                action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
+                action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+                unsafe {
+                    libc::sigemptyset(&mut action.sa_mask);
+                    libc::sigaction(signal, &action, &mut previous);
+                }
+                (signal, previous)
+            })
+            .collect()
+    });
     Ok(fds[0])
 }
 
-fn read_input(
-    mut reader: File,
-    signal_read: RawFd,
-    sender: &mpsc::Sender<MainMessage>,
-) -> Result<()> {
+fn read_input(mut reader: File, signal_read: RawFd, sender: &MainSender) -> Result<()> {
     let tty_fd = reader.as_raw_fd();
     let mut parser = InputParser::default();
     let mut buffer = vec![0u8; 64 * 1024];

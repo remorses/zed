@@ -15,6 +15,7 @@ use gpui::{
 };
 
 use crate::{
+    dispatcher::Wake,
     kitty::KittyPresenter,
     tty::{KeyEventKind, MouseEventKind, TerminalEvent, TerminalSize, Tty},
 };
@@ -59,6 +60,7 @@ pub(crate) struct WindowInner {
     tty: Rc<RefCell<Tty>>,
     display: Rc<dyn PlatformDisplay>,
     quit_requested: Rc<Cell<bool>>,
+    wake: Wake,
     state: RefCell<WindowState>,
     callbacks: RefCell<Callbacks>,
     renderer: RefCell<Renderer>,
@@ -74,6 +76,7 @@ impl TerminalWindow {
         tty: Rc<RefCell<Tty>>,
         display: Rc<dyn PlatformDisplay>,
         quit_requested: Rc<Cell<bool>>,
+        wake: Wake,
         size: TerminalSize,
     ) -> anyhow::Result<Self> {
         let size = with_pixel_fallback(size);
@@ -82,6 +85,7 @@ impl TerminalWindow {
             tty,
             display,
             quit_requested,
+            wake,
             state: RefCell::new(WindowState {
                 size,
                 scale_factor,
@@ -131,6 +135,12 @@ fn with_pixel_fallback(mut size: TerminalSize) -> TerminalSize {
 }
 
 impl WindowInner {
+    fn request_frame(&self) {
+        if !self.frame_requested.replace(true) {
+            self.wake.wake();
+        }
+    }
+
     fn logical_size(&self) -> Size<Pixels> {
         let state = self.state.borrow();
         size(
@@ -542,13 +552,13 @@ impl PlatformWindow for TerminalWindow {
         let inner = Rc::downgrade(&self.0);
         Some(Rc::new(move || {
             if let Some(inner) = inner.upgrade() {
-                inner.frame_requested.set(true);
+                inner.request_frame();
             }
         }))
     }
 
     fn schedule_frame(&self) {
-        self.0.frame_requested.set(true);
+        self.0.request_frame();
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {

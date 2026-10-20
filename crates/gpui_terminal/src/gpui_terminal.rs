@@ -25,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::{Arc, mpsc},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
@@ -40,10 +40,14 @@ use gpui::{
 };
 
 use crate::{
-    dispatcher::{MainMessage, TerminalDispatcher},
+    dispatcher::{MainMessage, MainSender, TerminalDispatcher, Wake},
     tty::{TerminalEvent, Tty},
     window::{TerminalWindow, WindowInner},
 };
+
+/// How long one `pump_events` call may run queued work before it yields to
+/// the host. A task that keeps waking itself must not starve the host loop.
+const PUMP_BUDGET: Duration = Duration::from_millis(8);
 
 /// A GPUI application whose single window is the current terminal.
 pub fn application() -> Result<gpui::Application> {
@@ -53,6 +57,13 @@ pub fn application() -> Result<gpui::Application> {
 }
 
 pub struct TerminalPlatform {
+    /// The host owns the run loop: `run` returns after launching and the host
+    /// calls `pump_events` whenever the wake hook fires.
+    embedded: bool,
+    dispatcher: Arc<TerminalDispatcher>,
+    wake: Wake,
+    scheduled_wake: Cell<Option<Instant>>,
+    shut_down: Cell<bool>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
@@ -70,14 +81,33 @@ pub struct TerminalPlatform {
 
 impl TerminalPlatform {
     /// Takes over the controlling terminal: raw mode, alternate screen, mouse
-    /// and keyboard reporting. The terminal is restored on quit or panic.
+    /// and keyboard reporting. The terminal is restored on quit, panic or
+    /// `exit(3)`. `Platform::run` blocks until the application quits.
     pub fn new() -> Result<Self> {
-        let (main_sender, main_receiver) = mpsc::channel();
+        Self::create(false)
+    }
+
+    /// Like `new`, for a host that owns the thread's run loop (e.g. Node).
+    /// `Platform::run` returns right after launching. Set a wake hook with
+    /// `set_wake_hook`, and call `pump_events` on this thread when it fires.
+    pub fn new_embedded() -> Result<Self> {
+        Self::create(true)
+    }
+
+    fn create(embedded: bool) -> Result<Self> {
+        let wake = Wake::default();
+        let (sender, main_receiver) = mpsc::channel();
+        let main_sender = MainSender::new(sender, wake.clone());
         let dispatcher = Arc::new(TerminalDispatcher::new(main_sender.clone()));
         let tty = Tty::open()?;
         let terminal_size = tty.size()?;
         tty.spawn_input_thread(main_sender)?;
         Ok(Self {
+            embedded,
+            dispatcher: dispatcher.clone(),
+            wake,
+            scheduled_wake: Cell::new(None),
+            shut_down: Cell::new(false),
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
             text_system: new_text_system(),
@@ -100,6 +130,70 @@ impl TerminalPlatform {
             cursor_style: Cell::new(None),
             quit_callback: RefCell::new(None),
         })
+    }
+
+    /// Called from any thread whenever the main thread has work: a runnable,
+    /// terminal input, or a frame that became due. Pass `None` to clear it.
+    pub fn set_wake_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.wake.set(hook);
+    }
+
+    /// Runs queued main-thread work and a due frame, without blocking.
+    /// Returns false once the application quit; the terminal is restored then.
+    pub fn pump_events(&self) -> bool {
+        if self.shut_down.get() {
+            return false;
+        }
+        let started = Instant::now();
+        while !self.quit_requested.get() {
+            if started.elapsed() >= PUMP_BUDGET {
+                self.wake.wake();
+                break;
+            }
+            match self.main_receiver.try_recv() {
+                Ok(message) => self.handle_message(message),
+                Err(_) => break,
+            }
+        }
+        if !self.quit_requested.get()
+            && let Some(deadline) = self.window().and_then(|window| window.run_frame_if_due())
+        {
+            self.wake_at(deadline);
+        }
+        if self.quit_requested.get() {
+            self.shut_down();
+            return false;
+        }
+        true
+    }
+
+    fn wake_at(&self, deadline: Instant) {
+        let pending = self
+            .scheduled_wake
+            .get()
+            .is_some_and(|scheduled| scheduled > Instant::now() && scheduled <= deadline);
+        if !pending {
+            self.scheduled_wake.set(Some(deadline));
+            self.dispatcher.wake_main_thread_at(deadline);
+        }
+    }
+
+    fn shut_down(&self) {
+        if self.shut_down.replace(true) {
+            return;
+        }
+        let should_quit = self
+            .quit_callback
+            .borrow_mut()
+            .as_mut()
+            .is_none_or(|callback| callback());
+        if !should_quit {
+            log::warn!("the quit callback asked to stay open, but the terminal session ended");
+        }
+        if let Some(window) = self.window() {
+            window.close();
+        }
+        tty::restore_terminal();
     }
 
     fn window(&self) -> Option<Rc<WindowInner>> {
@@ -176,6 +270,9 @@ impl Platform for TerminalPlatform {
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
         on_finish_launching();
+        if self.embedded {
+            return;
+        }
         while !self.quit_requested.get() {
             let deadline = self.window().and_then(|window| window.run_frame_if_due());
             let message = match deadline {
@@ -194,23 +291,12 @@ impl Platform for TerminalPlatform {
             };
             self.handle_message(message);
         }
-
-        let should_quit = self
-            .quit_callback
-            .borrow_mut()
-            .as_mut()
-            .is_none_or(|callback| callback());
-        if !should_quit {
-            log::warn!("the quit callback asked to stay open, but the terminal session ended");
-        }
-        if let Some(window) = self.window() {
-            window.close();
-        }
-        tty::restore_terminal();
+        self.shut_down();
     }
 
     fn quit(&self) {
         self.quit_requested.set(true);
+        self.wake.wake();
     }
 
     fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {}
@@ -256,6 +342,7 @@ impl Platform for TerminalPlatform {
             self.tty.clone(),
             self.display.clone(),
             self.quit_requested.clone(),
+            self.wake.clone(),
             size,
         )?;
         *self.window.borrow_mut() = Some((handle, Rc::downgrade(&window.0)));
