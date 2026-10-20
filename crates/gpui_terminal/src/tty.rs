@@ -102,6 +102,14 @@ pub(crate) enum TerminalEvent {
     Resize(TerminalSize),
     /// Reply to the `CSI ? 1016 $ p` query: whether SGR pixel mouse works.
     PixelMouseSupported(bool),
+    /// `ESC _ G i=<id>;<OK or error> ESC \`, the reply to a kitty graphics command.
+    GraphicsReply {
+        id: u32,
+        ok: bool,
+    },
+    /// Reply to `CSI c` (primary device attributes). Terminals answer in
+    /// order, so every reply to an earlier query has arrived before it.
+    DeviceAttributes,
     Quit,
 }
 
@@ -596,12 +604,19 @@ impl InputParser {
             b']' | b'_' | b'P' => {
                 // OSC, APC (kitty graphics replies) and DCS end with ST or BEL.
                 for index in 2..bytes.len() {
-                    if bytes[index] == 0x07 {
-                        return Parsed::Event(index + 1, None);
-                    }
-                    if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
-                        return Parsed::Event(index + 2, None);
-                    }
+                    let length = if bytes[index] == 0x07 {
+                        index + 1
+                    } else if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                        index + 2
+                    } else {
+                        continue;
+                    };
+                    let event = if second == b'_' && bytes.get(2) == Some(&b'G') {
+                        parse_graphics_reply(&bytes[3..index])
+                    } else {
+                        None
+                    };
+                    return Parsed::Event(length, event);
                 }
                 Parsed::Incomplete
             }
@@ -693,6 +708,7 @@ impl InputParser {
                 let state = params.trim_start_matches("?1016;").trim_end_matches('$');
                 Some(TerminalEvent::PixelMouseSupported(state != "0"))
             }
+            b'c' if params.starts_with('?') => Some(TerminalEvent::DeviceAttributes),
             _ => {
                 let name = legacy_final_key(final_byte)?;
                 let (_, modifiers, kind) = if params.is_empty() {
@@ -754,6 +770,21 @@ impl InputParser {
             modifiers,
         })
     }
+}
+
+/// `i=31,p=1;OK` → the image id and whether the command succeeded.
+fn parse_graphics_reply(body: &[u8]) -> Option<TerminalEvent> {
+    let body = std::str::from_utf8(body).ok()?;
+    let (keys, message) = body.split_once(';')?;
+    let id = keys
+        .split(',')
+        .find_map(|key| key.strip_prefix("i="))?
+        .parse()
+        .ok()?;
+    Some(TerminalEvent::GraphicsReply {
+        id,
+        ok: message == "OK",
+    })
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1118,7 +1149,8 @@ mod tests {
         parser.feed(b"\x1b[200~hello\r\nwor", &mut events);
         parser.feed(b"ld\x1b[20", &mut events);
         parser.feed(
-            b"1~\x1b_Gi=1;OK\x1b\\\x1b[?1016;2$y\x1b[48;30;100;630;1000t\x1b[I\x1b[9",
+            b"1~\x1b_Gi=1;OK\x1b\\\x1b_Gi=7,p=1;ENOENT:No such file\x1b\\\x1b[?62;22c\
+              \x1b[?1016;2$y\x1b[48;30;100;630;1000t\x1b[I\x1b[9",
             &mut events,
         );
         parser.feed(b"7u", &mut events);
@@ -1126,6 +1158,9 @@ mod tests {
             events,
             vec![
                 TerminalEvent::Paste("hello\nworld".into()),
+                TerminalEvent::GraphicsReply { id: 1, ok: true },
+                TerminalEvent::GraphicsReply { id: 7, ok: false },
+                TerminalEvent::DeviceAttributes,
                 TerminalEvent::PixelMouseSupported(true),
                 TerminalEvent::Resize(TerminalSize {
                     columns: 100,

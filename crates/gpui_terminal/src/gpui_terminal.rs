@@ -11,6 +11,7 @@
 //!                                                     │
 //!                                                     ▼
 //!                     terminal ◄── ESC_G a=T,t=s,i=1,p=1 (one ~100 byte write)
+//!                        │         or, over SSH, the frame inline (t=d,o=z)
 //!                        │
 //!                        └── /dev/tty bytes ──► input thread ──► main loop ──► PlatformInput
 //! ```

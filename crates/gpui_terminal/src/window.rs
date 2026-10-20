@@ -81,6 +81,7 @@ impl TerminalWindow {
     ) -> anyhow::Result<Self> {
         let size = with_pixel_fallback(size);
         let scale_factor = scale_factor_for(size);
+        let presenter = KittyPresenter::new(&mut tty.borrow_mut())?;
         Ok(Self(Rc::new(WindowInner {
             tty,
             display,
@@ -102,7 +103,7 @@ impl TerminalWindow {
                 DevicePixels(size.width as i32),
                 DevicePixels(size.height as i32),
             ))?),
-            presenter: RefCell::new(KittyPresenter::new()),
+            presenter: RefCell::new(presenter),
             frame_requested: Cell::new(true),
             last_frame: Cell::new(None),
         })))
@@ -175,6 +176,9 @@ impl WindowInner {
         {
             return Some(last_frame + MIN_FRAME_INTERVAL);
         }
+        if let Some(deadline) = self.presenter.borrow_mut().wait_until(now) {
+            return Some(deadline);
+        }
         self.frame_requested.set(false);
         self.last_frame.set(Some(now));
         let mut callback = self.callbacks.borrow_mut().request_frame.take()?;
@@ -219,6 +223,12 @@ impl WindowInner {
             TerminalEvent::Resize(size) => self.handle_resize(size),
             TerminalEvent::PixelMouseSupported(supported) => {
                 self.state.borrow_mut().pixel_mouse = supported;
+            }
+            TerminalEvent::GraphicsReply { id, ok } => {
+                self.presenter.borrow_mut().handle_reply(id, ok);
+            }
+            TerminalEvent::DeviceAttributes => {
+                self.presenter.borrow_mut().handle_device_attributes()
             }
             TerminalEvent::Quit => self.quit_requested.set(true),
         }
