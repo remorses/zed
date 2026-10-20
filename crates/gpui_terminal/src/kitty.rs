@@ -113,6 +113,8 @@ impl Drop for KittyPresenter {
 }
 
 /// macOS refuses write(2) on shared memory, so the object is always mapped.
+/// On Linux the pages are allocated up front: a full `/dev/shm` (64 MB in
+/// Docker by default) then fails here with ENOSPC instead of a SIGBUS on write.
 fn map_shared_memory(name: &CString, length: usize) -> Result<*mut libc::c_void> {
     let fd = unsafe {
         libc::shm_open(
@@ -124,8 +126,8 @@ fn map_shared_memory(name: &CString, length: usize) -> Result<*mut libc::c_void>
     if fd < 0 {
         return Err(io::Error::last_os_error()).context("shm_open");
     }
-    let result = if unsafe { libc::ftruncate(fd, length as libc::off_t) } != 0 {
-        Err(io::Error::last_os_error()).context("ftruncate")
+    let result = if let Err(error) = allocate(fd, length) {
+        Err(error)
     } else {
         let mapping = unsafe {
             libc::mmap(
@@ -148,4 +150,21 @@ fn map_shared_memory(name: &CString, length: usize) -> Result<*mut libc::c_void>
         unsafe { libc::shm_unlink(name.as_ptr()) };
     }
     result
+}
+
+#[cfg(target_os = "macos")]
+fn allocate(fd: libc::c_int, length: usize) -> Result<()> {
+    if unsafe { libc::ftruncate(fd, length as libc::off_t) } != 0 {
+        return Err(io::Error::last_os_error()).context("ftruncate");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn allocate(fd: libc::c_int, length: usize) -> Result<()> {
+    // posix_fallocate returns the error number instead of setting errno.
+    match unsafe { libc::posix_fallocate(fd, 0, length as libc::off_t) } {
+        0 => Ok(()),
+        error => Err(io::Error::from_raw_os_error(error)).context("posix_fallocate"),
+    }
 }

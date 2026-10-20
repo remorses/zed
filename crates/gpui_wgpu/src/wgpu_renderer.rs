@@ -180,7 +180,9 @@ enum InstanceData {
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    surface: wgpu::Surface<'static>,
+    /// `None` for an offscreen renderer, which draws into `readback` instead.
+    surface: Option<wgpu::Surface<'static>>,
+    readback: Option<Readback>,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
@@ -196,6 +198,17 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+}
+
+/// Offscreen render target plus the buffer its pixels are copied into.
+struct Readback {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    buffer: wgpu::Buffer,
+    width: u32,
+    height: u32,
+    /// wgpu requires buffer rows aligned to `COPY_BYTES_PER_ROW_ALIGNMENT`.
+    padded_bytes_per_row: u32,
 }
 
 impl WgpuResources {
@@ -311,9 +324,28 @@ impl WgpuRenderer {
         Self::new_internal(
             Some(Rc::clone(&gpu_context)),
             context,
-            surface,
+            Some(surface),
             config,
             compositor_gpu,
+            atlas,
+        )
+    }
+
+    /// Creates a renderer without a window. Frames are drawn with
+    /// [`render_to_pixels`](Self::render_to_pixels) and read back as RGBA, for
+    /// hosts that present frames themselves, such as a terminal.
+    pub fn new_offscreen(context: &WgpuContext, size: Size<DevicePixels>) -> anyhow::Result<Self> {
+        let atlas = Arc::new(WgpuAtlas::from_context(context));
+        Self::new_internal(
+            None,
+            context,
+            None,
+            WgpuSurfaceConfig {
+                size,
+                transparent: false,
+                preferred_present_mode: None,
+            },
+            None,
             atlas,
         )
     }
@@ -339,18 +371,27 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
     ) -> anyhow::Result<Self> {
         let atlas = Arc::new(WgpuAtlas::from_context(context));
-        Self::new_internal(None, context, surface, config, None, atlas)
+        Self::new_internal(None, context, Some(surface), config, None, atlas)
     }
 
     fn new_internal(
         gpu_context: Option<GpuContext>,
         context: &WgpuContext,
-        surface: wgpu::Surface<'static>,
+        surface: Option<wgpu::Surface<'static>>,
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
-        let surface_caps = surface.get_capabilities(&context.adapter);
+        let surface_caps = match &surface {
+            Some(surface) => surface.get_capabilities(&context.adapter),
+            // Offscreen frames are read back as RGBA, the layout image consumers expect.
+            None => wgpu::SurfaceCapabilities {
+                formats: vec![wgpu::TextureFormat::Rgba8Unorm],
+                present_modes: vec![wgpu::PresentMode::Fifo],
+                alpha_modes: vec![wgpu::CompositeAlphaMode::Opaque],
+                usages: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            },
+        };
         let preferred_formats = [
             wgpu::TextureFormat::Bgra8Unorm,
             wgpu::TextureFormat::Rgba8Unorm,
@@ -430,7 +471,9 @@ impl WgpuRenderer {
         };
         // Configure the surface immediately. The adapter selection process already validated
         // that this adapter can successfully configure this surface.
-        surface.configure(&context.device, &surface_config);
+        if let Some(surface) = &surface {
+            surface.configure(&context.device, &surface_config);
+        }
 
         let queue = Arc::clone(&context.queue);
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
@@ -583,6 +626,7 @@ impl WgpuRenderer {
             device,
             queue,
             surface,
+            readback: None,
             pipelines,
             bind_group_layouts,
             atlas_sampler,
@@ -1169,9 +1213,9 @@ impl WgpuRenderer {
                 texture.destroy();
             }
 
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
+            if let Some(surface) = &resources.surface {
+                surface.configure(&resources.device, &surface_config);
+            }
 
             // Invalidate intermediate textures - they will be lazily recreated
             // in draw() after we confirm the surface is healthy. This avoids
@@ -1228,9 +1272,9 @@ impl WgpuRenderer {
             let Some(resources) = self.resources.as_mut() else {
                 return;
             };
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
+            if let Some(surface) = &resources.surface {
+                surface.configure(&resources.device, &surface_config);
+            }
             resources.pipelines = Self::create_pipelines(
                 &resources.device,
                 &resources.bind_group_layouts,
@@ -1323,24 +1367,20 @@ impl WgpuRenderer {
 
         self.atlas.before_frame();
 
-        let frame = match self.resources().surface.get_current_texture() {
+        let Some(surface) = self.resources().surface.as_ref() else {
+            log::error!("draw() called on an offscreen renderer; use render_to_pixels()");
+            return false;
+        };
+        let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 // Textures must be destroyed before the surface can be reconfigured.
                 drop(frame);
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
+                surface.configure(&self.resources().device, &self.surface_config);
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
+                surface.configure(&self.resources().device, &self.surface_config);
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -1360,6 +1400,19 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        self.write_globals();
+
+        if let Err(error) = self.record_frame(scene, &frame_view) {
+            log::error!("{error:#}");
+            self.resources().queue.submit(std::iter::empty());
+            return false;
+        }
+
+        frame.present();
+        true
+    }
+
+    fn write_globals(&self) {
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
@@ -1406,15 +1459,149 @@ impl WgpuRenderer {
                 bytemuck::bytes_of(&gamma_params),
             );
         }
+    }
 
-        if let Err(error) = self.record_frame(scene, &frame_view) {
-            log::error!("{error:#}");
-            self.resources().queue.submit(std::iter::empty());
-            return false;
+    /// Renders `scene` offscreen and copies it into `pixels` as tightly packed
+    /// RGBA rows. `pixels` must hold `width * height * 4` bytes. Blocks until
+    /// the GPU finished, so the caller can hand the pixels on right away.
+    pub fn render_to_pixels(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        pixels: &mut [u8],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.resources().surface.is_none(),
+            "render_to_pixels needs a renderer from new_offscreen"
+        );
+        anyhow::ensure!(!self.device_lost(), "the GPU device was lost");
+        let width = (size.width.0.max(1) as u32).min(self.max_texture_size);
+        let height = (size.height.0.max(1) as u32).min(self.max_texture_size);
+        let unpadded_bytes_per_row = width * 4;
+        anyhow::ensure!(
+            pixels.len() == unpadded_bytes_per_row as usize * height as usize,
+            "pixel buffer does not match {width}x{height}"
+        );
+
+        self.update_drawable_size(size);
+        self.atlas.before_frame();
+        self.ensure_intermediate_textures();
+        self.ensure_readback(width, height);
+        self.write_globals();
+
+        let view = self
+            .resources()
+            .readback
+            .as_ref()
+            .map(|readback| readback.view.clone())
+            .context("readback target was just created")?;
+        self.record_frame(scene, &view)?;
+
+        let resources = self.resources();
+        let readback = resources
+            .readback
+            .as_ref()
+            .context("readback target was just created")?;
+        let mut encoder =
+            resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("readback_encoder"),
+                });
+        encoder.copy_texture_to_buffer(
+            readback.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback.buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(readback.padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = resources.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).ok();
+        });
+        resources
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| anyhow::anyhow!("waiting for the GPU: {error:?}"))?;
+        receiver
+            .recv()
+            .context("the readback map callback never ran")?
+            .map_err(|error| anyhow::anyhow!("mapping the readback buffer: {error}"))?;
+
+        {
+            let mapped = slice.get_mapped_range();
+            let padded = readback.padded_bytes_per_row as usize;
+            let unpadded = unpadded_bytes_per_row as usize;
+            for (source, target) in mapped
+                .chunks_exact(padded)
+                .zip(pixels.chunks_exact_mut(unpadded))
+            {
+                target.copy_from_slice(&source[..unpadded]);
+            }
         }
+        readback.buffer.unmap();
 
-        frame.present();
-        true
+        if let Some(error) = self.last_error.lock().unwrap().take() {
+            anyhow::bail!("GPU error during offscreen frame: {error}");
+        }
+        Ok(())
+    }
+
+    fn ensure_readback(&mut self, width: u32, height: u32) {
+        let format = self.surface_config.format;
+        let resources = self.resources_mut();
+        if resources
+            .readback
+            .as_ref()
+            .is_some_and(|readback| readback.width == width && readback.height == height)
+        {
+            return;
+        }
+        let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("readback_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let padded_bytes_per_row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback_buffer"),
+            size: u64::from(padded_bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        resources.readback = Some(Readback {
+            texture,
+            view,
+            buffer,
+            width,
+            height,
+            padded_bytes_per_row,
+        });
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
@@ -2095,7 +2282,7 @@ impl WgpuRenderer {
                 .as_mut()
                 .expect("GPU resources not available");
             surface.configure(&res.device, &self.surface_config);
-            res.surface = surface;
+            res.surface = Some(surface);
 
             // Invalidate intermediate textures — they'll be recreated lazily.
             res.invalidate_intermediate_textures();
@@ -2190,7 +2377,7 @@ impl WgpuRenderer {
         *self = Self::new_internal(
             Some(gpu_context.clone()),
             context,
-            surface,
+            Some(surface),
             config,
             self.compositor_gpu,
             self.atlas.clone(),
@@ -2313,7 +2500,9 @@ mod tests {
     // https://github.com/gpui-ce/gpui-ce/commit/6d043b22e477
     #[test]
     fn surface_shader_samples_a_single_rgba_texture() {
-        assert!(STORAGE_BUFFER_SHADERS.contains("@group(1) @binding(1) var t_surface: texture_2d<f32>"));
+        assert!(
+            STORAGE_BUFFER_SHADERS.contains("@group(1) @binding(1) var t_surface: texture_2d<f32>")
+        );
         assert!(!STORAGE_BUFFER_SHADERS.contains("var t_y: texture_2d<f32>"));
         assert!(!STORAGE_BUFFER_SHADERS.contains("var t_cb_cr: texture_2d<f32>"));
         assert!(WEBGL_SHADERS.contains("@group(1) @binding(1) var t_surface: texture_2d<f32>"));

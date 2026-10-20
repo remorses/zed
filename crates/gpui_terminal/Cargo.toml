@@ -11,20 +11,25 @@ workspace = true
 [lib]
 path = "src/gpui_terminal.rs"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))'.dependencies]
 anyhow.workspace = true
 base64.workspace = true
 futures.workspace = true
 gpui.workspace = true
-gpui_macos = { workspace = true, features = ["font-kit"] }
 libc.workspace = true
 log.workspace = true
-metal.workspace = true
-objc.workspace = true
 parking_lot.workspace = true
 raw-window-handle.workspace = true
 smol.workspace = true
 uuid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_macos = { workspace = true, features = ["font-kit"] }
+metal.workspace = true
+objc.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_wgpu = { workspace = true, features = ["font-kit"] }
 
 [[example]]
 name = "terminal_hello"

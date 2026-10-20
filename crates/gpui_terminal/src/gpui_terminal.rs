@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 //! Runs GPUI applications inside a terminal.
 //!
 //! The window is the terminal grid. Each frame is rendered offscreen on the
@@ -7,9 +7,9 @@
 //! resize reports) is translated into GPUI platform input.
 //!
 //! ```text
-//! GPUI Scene ──► Metal offscreen texture ──► BGRA readback
-//!                                              │ swizzle into POSIX shm
-//!                                              ▼
+//! GPUI Scene ──► Metal / wgpu offscreen texture ──► RGBA readback into POSIX shm
+//!                                                     │
+//!                                                     ▼
 //!                     terminal ◄── ESC_G a=T,t=s,i=1,p=1 (one ~100 byte write)
 //!                        │
 //!                        └── /dev/tty bytes ──► input thread ──► main loop ──► PlatformInput
@@ -62,6 +62,8 @@ pub struct TerminalPlatform {
     quit_requested: Rc<Cell<bool>>,
     window: RefCell<Option<(AnyWindowHandle, Weak<WindowInner>)>>,
     clipboard: RefCell<Option<ClipboardItem>>,
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    primary: RefCell<Option<ClipboardItem>>,
     cursor_style: Cell<Option<CursorStyle>>,
     quit_callback: RefCell<Option<Box<dyn FnMut() -> bool>>>,
 }
@@ -78,7 +80,7 @@ impl TerminalPlatform {
         Ok(Self {
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
-            text_system: Arc::new(gpui_macos::MacTextSystem::new()),
+            text_system: new_text_system(),
             main_receiver,
             tty: Rc::new(RefCell::new(tty)),
             display: Rc::new(TerminalDisplay {
@@ -93,6 +95,8 @@ impl TerminalPlatform {
             quit_requested: Rc::new(Cell::new(false)),
             window: RefCell::new(None),
             clipboard: RefCell::new(None),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            primary: RefCell::new(None),
             cursor_style: Cell::new(None),
             quit_callback: RefCell::new(None),
         })
@@ -108,18 +112,31 @@ impl TerminalPlatform {
         }
     }
 
-    /// Runs macOS `open(1)`, which hands URLs and files to the user's apps.
-    fn run_open<const N: usize>(&self, arguments: [std::ffi::OsString; N]) {
+    /// OSC 52 sets a system selection (`c` clipboard, `p` primary), also over SSH.
+    fn write_selection(&self, selection: char, item: &ClipboardItem) {
+        if let Some(text) = item.text() {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+            self.write_to_terminal(format!("\x1b]52;{selection};{encoded}\x1b\\").as_bytes());
+        }
+    }
+
+    /// Hands a URL or file to the user's apps with `open(1)` or `xdg-open(1)`.
+    fn run_open(&self, arguments: Vec<std::ffi::OsString>) {
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
         self.background_executor
             .spawn(async move {
-                match smol::process::Command::new("open")
+                match smol::process::Command::new(program)
                     .args(&arguments)
                     .status()
                     .await
                 {
                     Ok(status) if status.success() => {}
-                    Ok(status) => log::error!("open {arguments:?} exited with {status}"),
-                    Err(error) => log::error!("failed to run open {arguments:?}: {error}"),
+                    Ok(status) => log::error!("{program} {arguments:?} exited with {status}"),
+                    Err(error) => log::error!("failed to run {program} {arguments:?}: {error}"),
                 }
             })
             .detach();
@@ -250,7 +267,7 @@ impl Platform for TerminalPlatform {
     }
 
     fn open_url(&self, url: &str) {
-        self.run_open([url.into()]);
+        self.run_open(vec![url.into()]);
     }
 
     fn on_open_urls(&self, _callback: Box<dyn FnMut(Vec<String>)>) {}
@@ -293,11 +310,16 @@ impl Platform for TerminalPlatform {
     }
 
     fn reveal_path(&self, path: &Path) {
-        self.run_open(["-R".into(), path.into()]);
+        if cfg!(target_os = "macos") {
+            self.run_open(vec!["-R".into(), path.into()]);
+        } else {
+            // xdg-open cannot select a file; open the folder that contains it.
+            self.run_open(vec![path.parent().unwrap_or(path).into()]);
+        }
     }
 
     fn open_with_system(&self, path: &Path) {
-        self.run_open([path.into()]);
+        self.run_open(vec![path.into()]);
     }
 
     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
@@ -388,20 +410,29 @@ impl Platform for TerminalPlatform {
         self.clipboard.borrow().clone()
     }
 
-    /// OSC 52 puts text on the system clipboard, also over SSH.
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        if let Some(text) = item.text() {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-            self.write_to_terminal(format!("\x1b]52;c;{encoded}\x1b\\").as_bytes());
-        }
+        self.write_selection('c', &item);
         *self.clipboard.borrow_mut() = Some(item);
     }
 
+    #[cfg(target_os = "macos")]
     fn read_from_find_pasteboard(&self) -> Option<ClipboardItem> {
         None
     }
 
+    #[cfg(target_os = "macos")]
     fn write_to_find_pasteboard(&self, _item: ClipboardItem) {}
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn read_from_primary(&self) -> Option<ClipboardItem> {
+        self.primary.borrow().clone()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn write_to_primary(&self, item: ClipboardItem) {
+        self.write_selection('p', &item);
+        *self.primary.borrow_mut() = Some(item);
+    }
 
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
         Task::ready(Err(anyhow::anyhow!(
@@ -428,6 +459,16 @@ impl Platform for TerminalPlatform {
     }
 
     fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {}
+}
+
+#[cfg(target_os = "macos")]
+fn new_text_system() -> Arc<dyn PlatformTextSystem> {
+    Arc::new(gpui_macos::MacTextSystem::new())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn new_text_system() -> Arc<dyn PlatformTextSystem> {
+    Arc::new(gpui_wgpu::CosmicTextSystem::new("IBM Plex Sans"))
 }
 
 /// The kitty keyboard protocol reports layout-independent keys plus the

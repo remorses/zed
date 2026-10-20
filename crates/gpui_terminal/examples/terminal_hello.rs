@@ -6,7 +6,7 @@
 //!
 //! Press ctrl-c to quit.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 mod app {
     use gpui::{
         App, Context, FocusHandle, MouseMoveEvent, Point, Window, WindowOptions, div, prelude::*,
@@ -110,12 +110,12 @@ mod app {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 fn main() -> anyhow::Result<()> {
     app::main()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 fn main() {
-    eprintln!("gpui_terminal only supports macOS so far");
+    eprintln!("gpui_terminal supports macOS, Linux and FreeBSD");
 }

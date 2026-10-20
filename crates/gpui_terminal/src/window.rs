@@ -94,7 +94,10 @@ impl TerminalWindow {
                 title: String::new(),
             }),
             callbacks: RefCell::new(Callbacks::default()),
-            renderer: RefCell::new(Renderer::new()?),
+            renderer: RefCell::new(Renderer::new(gpui::size(
+                DevicePixels(size.width as i32),
+                DevicePixels(size.height as i32),
+            ))?),
             presenter: RefCell::new(KittyPresenter::new()),
             frame_requested: Cell::new(true),
             last_frame: Cell::new(None),
@@ -380,9 +383,7 @@ impl WindowInner {
             let state = self.state.borrow();
             (state.size.width, state.size.height)
         };
-        // The loop has no run loop draining autoreleased Metal objects
-        // (command buffers, encoders, pass descriptors), so drain per frame.
-        let result = objc::rc::autoreleasepool(|| {
+        let result = autoreleasepool(|| {
             let mut presenter = self.presenter.borrow_mut();
             let mut frame = presenter.begin_frame(width, height)?;
             self.renderer.borrow_mut().render(
@@ -608,7 +609,7 @@ struct Renderer(gpui_macos::metal_renderer::MetalRenderer);
 
 #[cfg(target_os = "macos")]
 impl Renderer {
-    fn new() -> anyhow::Result<Self> {
+    fn new(_size: Size<DevicePixels>) -> anyhow::Result<Self> {
         let instance_buffer_pool = Arc::new(parking_lot::Mutex::new(
             gpui_macos::metal_renderer::InstanceBufferPool::default(),
         ));
@@ -632,5 +633,47 @@ impl Renderer {
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.sprite_atlas().clone()
+    }
+}
+
+/// The event loop has no Cocoa run loop draining autoreleased Metal objects
+/// (command buffers, encoders, pass descriptors), so each frame drains its own.
+#[cfg(target_os = "macos")]
+fn autoreleasepool<T>(body: impl FnOnce() -> T) -> T {
+    objc::rc::autoreleasepool(body)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn autoreleasepool<T>(body: impl FnOnce() -> T) -> T {
+    body()
+}
+
+#[cfg(not(target_os = "macos"))]
+struct Renderer {
+    renderer: gpui_wgpu::WgpuRenderer,
+    _context: gpui_wgpu::WgpuContext,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Renderer {
+    fn new(size: Size<DevicePixels>) -> anyhow::Result<Self> {
+        let context = gpui_wgpu::WgpuContext::new_offscreen()?;
+        Ok(Self {
+            renderer: gpui_wgpu::WgpuRenderer::new_offscreen(&context, size)?,
+            _context: context,
+        })
+    }
+
+    fn render(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        pixels: &mut [u8],
+    ) -> anyhow::Result<()> {
+        self.renderer.render_to_pixels(scene, size, pixels)
+    }
+
+    fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+        self.renderer.sprite_atlas().clone()
     }
 }
