@@ -14,6 +14,8 @@ path = "src/gpui_wgpu.rs"
 [features]
 default = []
 font-kit = ["dep:font-kit"]
+# Offscreen image readback for the GPU test renderer (render_to_image).
+test-support = ["gpui/test-support", "dep:image"]
 
 [dependencies]
 gpui.workspace = true
@@ -33,6 +35,9 @@ unicode-bidi.workspace = true
 unicode-segmentation.workspace = true
 gpui_util.workspace = true
 wgpu.workspace = true
+
+# Only pulled under `test-support`: render_to_image returns an image::RgbaImage.
+image = { workspace = true, optional = true }
 
 # Optional: only needed on platforms with multiple font sources (e.g. Linux)
 # WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io

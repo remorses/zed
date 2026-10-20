@@ -234,6 +234,16 @@ impl Platform for VisualTestPlatform {
         *self.find_pasteboard.lock() = Some(item);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn read_from_primary(&self) -> Option<ClipboardItem> {
+        None
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn write_to_primary(&self, _item: ClipboardItem) {
+        // The test platform does not simulate the X11/Wayland primary selection.
+    }
+
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
         Task::ready(Ok(()))
     }
