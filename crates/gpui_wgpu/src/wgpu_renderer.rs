@@ -1474,16 +1474,35 @@ impl WgpuRenderer {
             self.resources().surface.is_none(),
             "render_to_pixels needs a renderer from new_offscreen"
         );
+        self.update_drawable_size(size);
+        self.render_readback(scene, pixels)
+    }
+
+    /// Renders `scene` at the current surface size and reads it back as RGBA,
+    /// without acquiring, configuring or presenting the surface.
+    #[cfg(feature = "test-support")]
+    pub fn render_to_image(&mut self, scene: &Scene) -> Result<image::RgbaImage> {
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let mut pixels = vec![0; width as usize * height as usize * 4];
+        self.render_readback(scene, &mut pixels)?;
+        image::RgbaImage::from_raw(width, height, pixels)
+            .context("readback size does not match the surface size")
+    }
+
+    /// Renders `scene` at the surface size into the readback texture and copies
+    /// it into `pixels` as tightly packed RGBA rows.
+    fn render_readback(&mut self, scene: &Scene, pixels: &mut [u8]) -> Result<()> {
         anyhow::ensure!(!self.device_lost(), "the GPU device was lost");
-        let width = (size.width.0.max(1) as u32).min(self.max_texture_size);
-        let height = (size.height.0.max(1) as u32).min(self.max_texture_size);
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let format = self.surface_config.format;
         let unpadded_bytes_per_row = width * 4;
         anyhow::ensure!(
             pixels.len() == unpadded_bytes_per_row as usize * height as usize,
             "pixel buffer does not match {width}x{height}"
         );
 
-        self.update_drawable_size(size);
         self.atlas.before_frame();
         self.ensure_intermediate_textures();
         self.ensure_readback(width, height);
@@ -1555,6 +1574,16 @@ impl WgpuRenderer {
             }
         }
         readback.buffer.unmap();
+
+        // A windowed renderer draws in the surface format, which is usually BGRA.
+        if matches!(
+            format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
 
         if let Some(error) = self.last_error.lock().unwrap().take() {
             anyhow::bail!("GPU error during offscreen frame: {error}");
@@ -1739,189 +1768,6 @@ impl WgpuRenderer {
             .queue
             .submit(std::iter::once(encoder.finish()));
         Ok(())
-    }
-
-    /// Render `scene` into an offscreen wgpu texture and read the pixels back as
-    /// an `image::RgbaImage`, without presenting. This is the Linux/FreeBSD
-    /// analogue of the macOS Metal and Windows DirectX `render_to_image` paths:
-    /// it reuses `record_frame` to encode the scene into a fresh offscreen
-    /// render target, then copies that target into a CPU-readable buffer and
-    /// maps it back to the CPU.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn render_to_image(&mut self, scene: &Scene) -> Result<image::RgbaImage> {
-        let width = self.surface_config.width;
-        let height = self.surface_config.height;
-        let format = self.surface_config.format;
-        let (device, queue) = {
-            let resources = self.resources();
-            (resources.device.clone(), resources.queue.clone())
-        };
-
-        // Offscreen render target matching the surface size and format, so the
-        // scene's pipelines (built for the surface format) can bind it.
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("gpuix render_to_image target"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            // COPY_SRC is required for the copy_texture_to_buffer readback below;
-            // without it the copy is a validation error and the buffer reads back zeros.
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Write the globals buffer exactly as `draw` does, so the render is
-        // self-contained and does not depend on a prior on-screen frame.
-        let gamma_params = GammaParams {
-            gamma_ratios: self.rendering_params.gamma_ratios,
-            grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
-            subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
-            is_bgr: self.is_bgr as u32,
-            _pad: 0,
-        };
-        let globals = GlobalParams {
-            viewport_size: [width as f32, height as f32],
-            premultiplied_alpha: if self.surface_config.alpha_mode
-                == wgpu::CompositeAlphaMode::PreMultiplied
-            {
-                1
-            } else {
-                0
-            },
-            pad: 0,
-        };
-        let path_globals = GlobalParams {
-            premultiplied_alpha: 0,
-            ..globals
-        };
-        {
-            let resources = self.resources();
-            resources
-                .queue
-                .write_buffer(&resources.globals_buffer, 0, bytemuck::bytes_of(&globals));
-            resources.queue.write_buffer(
-                &resources.globals_buffer,
-                self.path_globals_offset,
-                bytemuck::bytes_of(&path_globals),
-            );
-            resources.queue.write_buffer(
-                &resources.globals_buffer,
-                self.gamma_offset,
-                bytemuck::bytes_of(&gamma_params),
-            );
-        }
-
-        // Flush pending glyph-atlas uploads, exactly as `draw` does before
-        // presenting. Without this the offscreen render samples an atlas whose
-        // glyphs have not reached the GPU yet, and all text is invisible.
-        self.atlas.before_frame();
-
-        // Encode the scene into the offscreen target and submit, as `draw` does.
-        self.ensure_intermediate_textures();
-        self.record_frame(scene, &view)
-            .with_context(|| "rendering the scene into the offscreen render target")?;
-        drop(view);
-
-        // CPU-readable staging buffer. wgpu requires `bytes_per_row` to be a
-        // multiple of COPY_BYTES_PER_ROW_ALIGNMENT for a multi-row copy (a
-        // `None` layout is a validation error that makes the copy a no-op and
-        // the buffer read back all zeros), so the staging buffer is padded per
-        // row and the padding is stripped after the readback.
-        let unpadded_bytes_per_row = u64::from(width) * 4;
-        let row_alignment = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(row_alignment) * row_alignment;
-        let size = padded_bytes_per_row * u64::from(height);
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpuix render_to_image readback"),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gpuix render_to_image readback"),
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row as u32),
-                    rows_per_image: None,
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        queue.submit([encoder.finish()]);
-
-        // Map the buffer, polling the device until the copy has landed.
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let done_map = std::sync::Arc::clone(&done);
-        buffer.map_async(
-            wgpu::MapMode::Read,
-            0..size,
-            move |result| {
-                if result.is_err() {
-                    log::error!("render_to_image readback map failed: {result:?}");
-                }
-                done_map.store(true, std::sync::atomic::Ordering::Relaxed);
-            },
-        );
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !done.load(std::sync::atomic::Ordering::Relaxed) {
-            match device.poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: Some(std::time::Duration::from_millis(50)),
-            }) {
-                Ok(_) => {}
-                Err(wgpu::PollError::Timeout) => {}
-                Err(e) => return Err(anyhow::anyhow!("wgpu device poll failed: {e}")),
-            }
-            if std::time::Instant::now() > deadline {
-                anyhow::bail!("timed out waiting for the wgpu readback map to complete");
-            }
-        }
-
-        let mapped: Vec<u8> = buffer.get_mapped_range(0..size).to_vec();
-        buffer.unmap();
-
-        // Strip the per-row padding the copy layout required, then swap the red
-        // and blue channels for any BGRA format (image::RgbaImage wants RGBA).
-        let swizzle_bgra = matches!(
-            format,
-            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
-        );
-        let mut pixels: Vec<u8> = Vec::with_capacity((unpadded_bytes_per_row * u64::from(height)) as usize);
-        for row in mapped.chunks_exact(padded_bytes_per_row as usize) {
-            for px in row[..unpadded_bytes_per_row as usize].chunks_exact(4) {
-                if swizzle_bgra {
-                    pixels.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-                } else {
-                    pixels.extend_from_slice(px);
-                }
-            }
-        }
-
-        image::RgbaImage::from_raw(width, height, pixels)
-            .context("building the RgbaImage from the wgpu readback")
     }
 
     // Ported from gpui-ce #39 / #121: sample an RGBA wgpu texture in the scene.
@@ -2639,7 +2485,166 @@ impl RenderingParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{MonochromeSprite, PolychromeSprite, Quad, Shadow, SubpixelSprite, Underline};
+    use gpui::{
+        AtlasKey, ContentMask, FontId, GlyphId, Hsla, MonochromeSprite, PlatformAtlas,
+        PolychromeSprite, Quad, RenderGlyphParams, Shadow, SubpixelSprite, TransformationMatrix,
+        Underline, blue, point, px, red, size, white,
+    };
+    use std::borrow::Cow;
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(width), ScaledPixels(height)),
+        )
+    }
+
+    fn insert_quad(scene: &mut Scene, bounds: Bounds<ScaledPixels>, color: Hsla) {
+        scene.insert_primitive(Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: color.into(),
+            ..Default::default()
+        });
+    }
+
+    fn render(renderer: &mut WgpuRenderer, scene: &Scene, width: i32, height: i32) -> Vec<u8> {
+        let mut pixels = vec![0; width as usize * height as usize * 4];
+        renderer
+            .render_to_pixels(
+                scene,
+                size(DevicePixels(width), DevicePixels(height)),
+                &mut pixels,
+            )
+            .expect("offscreen render should succeed");
+        pixels
+    }
+
+    fn solid_pixels(color: [u8; 4], width: usize, height: usize) -> Vec<u8> {
+        color.repeat(width * height)
+    }
+
+    // Three pixels make a 12 byte row, which wgpu pads to 256 bytes, so a missed
+    // row stride shows up as garbage from the second row on.
+    #[test]
+    fn render_to_pixels_strips_row_padding_and_returns_rgba_for_each_target_format()
+    -> anyhow::Result<()> {
+        let context = WgpuContext::new_offscreen()?;
+        let mut scene = Scene::default();
+        insert_quad(&mut scene, scaled_bounds(0., 0., 3., 2.), red());
+        insert_quad(&mut scene, scaled_bounds(2., 0., 1., 2.), blue());
+        scene.finish();
+        let expected = [RED, RED, BLUE, RED, RED, BLUE].concat();
+
+        // Windowed renderers draw in the surface format, usually BGRA, while
+        // new_offscreen picks RGBA. Both must read back as RGBA.
+        for format in [
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
+        ] {
+            let mut renderer =
+                WgpuRenderer::new_offscreen(&context, size(DevicePixels(3), DevicePixels(2)))?;
+            renderer.surface_config.format = format;
+            let resources = renderer.resources.as_mut().context("GPU resources")?;
+            resources.pipelines = WgpuRenderer::create_pipelines(
+                &resources.device,
+                &resources.bind_group_layouts,
+                format,
+                renderer.surface_config.alpha_mode,
+                renderer.rendering_params.path_sample_count,
+                renderer.dual_source_blending,
+                renderer.uses_webgl_instance_data,
+            );
+
+            assert_eq!(render(&mut renderer, &scene, 3, 2), expected, "{format:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn render_to_pixels_reuses_and_resizes_the_readback() -> anyhow::Result<()> {
+        let context = WgpuContext::new_offscreen()?;
+        let mut renderer =
+            WgpuRenderer::new_offscreen(&context, size(DevicePixels(3), DevicePixels(2)))?;
+        let scene_of = |color: Hsla| {
+            let mut scene = Scene::default();
+            insert_quad(&mut scene, scaled_bounds(0., 0., 64., 64.), color);
+            scene.finish();
+            scene
+        };
+
+        let red_scene = scene_of(red());
+        let blue_scene = scene_of(blue());
+        assert_eq!(
+            render(&mut renderer, &red_scene, 3, 2),
+            solid_pixels(RED, 3, 2)
+        );
+        assert_eq!(
+            render(&mut renderer, &blue_scene, 3, 2),
+            solid_pixels(BLUE, 3, 2)
+        );
+        assert_eq!(
+            render(&mut renderer, &red_scene, 5, 3),
+            solid_pixels(RED, 5, 3)
+        );
+        assert_eq!(
+            render(&mut renderer, &blue_scene, 2, 4),
+            solid_pixels(BLUE, 2, 4)
+        );
+        Ok(())
+    }
+
+    // Glyphs are queued for upload when they are rasterized and only reach the
+    // GPU in atlas.before_frame(). A readback that skips it paints no text.
+    #[test]
+    fn render_to_pixels_flushes_glyph_uploads_queued_this_frame() -> anyhow::Result<()> {
+        let context = WgpuContext::new_offscreen()?;
+        let mut renderer =
+            WgpuRenderer::new_offscreen(&context, size(DevicePixels(4), DevicePixels(4)))?;
+        let key = AtlasKey::Glyph(RenderGlyphParams {
+            font_id: FontId(0),
+            glyph_id: GlyphId(0),
+            font_size: px(16.),
+            subpixel_variant: point(0, 0),
+            scale_factor: 1.,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation: 0,
+        });
+        let tile = renderer
+            .sprite_atlas()
+            .get_or_insert_with(&key, &mut || {
+                Ok(Some((
+                    size(DevicePixels(4), DevicePixels(4)),
+                    Cow::Owned(vec![255; 16]),
+                )))
+            })?
+            .context("glyph tile")?;
+
+        let bounds = scaled_bounds(0., 0., 4., 4.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            color: white(),
+            tile,
+            transformation: TransformationMatrix::unit(),
+        });
+        scene.finish();
+
+        let pixels = render(&mut renderer, &scene, 4, 4);
+        let center = &pixels[(4 + 1) * 4..(4 + 2) * 4];
+        assert!(
+            center.iter().all(|channel| *channel >= 250),
+            "glyph pixel should be white, got {center:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn webgl_shader_is_valid_wgsl_without_storage_buffers() {
