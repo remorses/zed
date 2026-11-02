@@ -548,6 +548,7 @@ impl WebWindowInner {
             modifiers,
             key: key.to_string(),
             key_char: None,
+            code: None,
         };
         self.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
             keystroke: keystroke.clone(),
@@ -705,6 +706,7 @@ impl WebWindowInner {
                 modifiers,
                 key,
                 key_char: key_char.clone(),
+                code: dom_physical_key_code(&event),
             };
 
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
@@ -769,6 +771,7 @@ impl WebWindowInner {
                 modifiers,
                 key,
                 key_char,
+                code: dom_physical_key_code(&event),
             };
 
             let result = this.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
@@ -1142,6 +1145,12 @@ fn dom_key_to_gpui_key(event: &web_sys::KeyboardEvent) -> String {
             other.to_lowercase()
         }
     }
+}
+
+/// The physical key in the DOM `KeyboardEvent.code` spelling. Mobile browsers
+/// may leave it empty, in which case there is nothing to report.
+fn dom_physical_key_code(event: &web_sys::KeyboardEvent) -> Option<String> {
+    Some(event.code()).filter(|code| !code.is_empty())
 }
 
 fn dom_mouse_button_to_gpui(button: i16) -> MouseButton {

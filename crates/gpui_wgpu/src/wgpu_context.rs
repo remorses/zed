@@ -141,6 +141,57 @@ impl WgpuContext {
         })
     }
 
+    /// Creates a context with no window surface, for offscreen rendering
+    /// with [`WgpuRenderer::new_offscreen`](crate::WgpuRenderer::new_offscreen).
+    /// Software adapters (llvmpipe, lavapipe) are accepted, so this also works
+    /// on machines without a GPU.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_offscreen() -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        let adapter = gpui::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .context("no GPU adapter available for offscreen rendering")?;
+        let (device, queue, dual_source_blending, color_texture_format) =
+            gpui::block_on(Self::create_device(&adapter))?;
+
+        let device_lost = Arc::new(AtomicBool::new(false));
+        device.set_device_lost_callback({
+            let device_lost = Arc::clone(&device_lost);
+            move |reason, message| {
+                log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        log::info!(
+            "Selected offscreen GPU adapter: {:?} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
+
+        let backend = WgpuBackend::Native(adapter.get_info().backend);
+        Ok(Self {
+            instance,
+            adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            backend,
+            dual_source_blending,
+            color_texture_format,
+            device_lost,
+        })
+    }
+
     #[cfg(target_family = "wasm")]
     pub async fn new_web(
         canvas: &web_sys::HtmlCanvasElement,

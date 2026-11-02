@@ -2,7 +2,7 @@ use gpui::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
     NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, point, px,
+    ScrollWheelEvent, TouchPhase, keystroke_code, point, px,
 };
 
 use crate::{
@@ -492,6 +492,7 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
             },
             key,
             key_char,
+            code: keystroke_code::from_macos_key_code(native_event.keyCode()).map(str::to_owned),
         }
     }
 }

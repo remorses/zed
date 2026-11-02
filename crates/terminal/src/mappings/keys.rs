@@ -276,6 +276,7 @@ mod test {
             },
             key: "🖖🏻".to_string(), //2 char string
             key_char: None,
+            code: None,
         };
         assert_eq!(to_esc_str(&ks, Modes::NONE, false), None);
     }

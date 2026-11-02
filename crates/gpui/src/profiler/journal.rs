@@ -672,8 +672,11 @@ pub(crate) fn record_window_closed(window_id: WindowId) {
 
 const SLOT_WRITER: usize = 1 << (usize::BITS - 1);
 const SLOT_READER_MASK: usize = !SLOT_WRITER;
-const EMPTY_SEQUENCE: u64 = u64::MAX;
 
+/// A slot's `sequence` holds the published sequence plus one, so that a slot nothing has been
+/// published to is all zeros. That lets the ring be allocated zeroed: the operating system backs
+/// its pages as slots are first written, so a process that records a few entries (one that never
+/// reads the journal) does not make the whole ring resident.
 struct JournalSlot {
     users: AtomicUsize,
     sequence: AtomicU64,
@@ -685,14 +688,6 @@ struct JournalSlot {
 unsafe impl Sync for JournalSlot {}
 
 impl JournalSlot {
-    fn new() -> Self {
-        Self {
-            users: AtomicUsize::new(0),
-            sequence: AtomicU64::new(EMPTY_SEQUENCE),
-            entry: UnsafeCell::new(MaybeUninit::uninit()),
-        }
-    }
-
     fn try_publish(&self, sequence: u64, entry: ForegroundJournalEntry) -> bool {
         if self
             .users
@@ -707,14 +702,15 @@ impl JournalSlot {
         unsafe {
             (*self.entry.get()).write(entry);
         }
-        self.sequence.store(sequence, Ordering::Relaxed);
+        self.sequence
+            .store(sequence.wrapping_add(1), Ordering::Relaxed);
         self.users.store(0, Ordering::Release);
         true
     }
 
     fn try_read(&self, expected_sequence: u64) -> Option<ForegroundJournalEntry> {
         let _guard = JournalSlotReadGuard::try_new(self)?;
-        if self.sequence.load(Ordering::Relaxed) != expected_sequence {
+        if self.sequence.load(Ordering::Relaxed) != expected_sequence.wrapping_add(1) {
             return None;
         }
 
@@ -780,8 +776,11 @@ struct JournalRing {
 impl JournalRing {
     fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
+        // SAFETY: every field of a slot is valid zeroed: `users` 0 is unowned, `sequence` 0 is
+        // empty, and the entry is `MaybeUninit`.
+        let slots = unsafe { Box::<[JournalSlot]>::new_zeroed_slice(capacity).assume_init() };
         Self {
-            slots: (0..capacity).map(|_| JournalSlot::new()).collect(),
+            slots,
             finalized: AtomicU64::new(0),
             offered: AtomicU64::new(0),
         }

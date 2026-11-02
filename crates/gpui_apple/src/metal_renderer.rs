@@ -138,6 +138,10 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+    /// CPU-readable render target reused across `render_scene_to_pixels` calls.
+    readback_target: Option<metal::Texture>,
+    /// Format of every render target and pipeline output.
+    pixel_format: MTLPixelFormat,
 }
 
 #[repr(C)]
@@ -173,17 +177,28 @@ impl MetalRenderer {
             ];
         }
 
-        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
+        Self::new_internal(
+            device,
+            Some(layer),
+            !transparent,
+            instance_buffer_pool,
+            MTLPixelFormat::BGRA8Unorm,
+        )
     }
 
     /// Creates a new headless MetalRenderer for offscreen rendering without a window.
     ///
     /// This renderer can render scenes to images without requiring a CAMetalLayer,
-    /// window, or AppKit. Use `render_scene_to_image()` to render scenes.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Self {
+    /// window, or AppKit. Use `render_scene_to_pixels()` to render scenes.
+    ///
+    /// `pixel_format` is the format of the produced pixels: `BGRA8Unorm` or
+    /// `RGBA8Unorm`. Rendering in the consumer's format avoids a CPU swizzle.
+    pub fn new_headless(
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        pixel_format: MTLPixelFormat,
+    ) -> Self {
         let device = Self::create_device();
-        Self::new_internal(device, None, true, instance_buffer_pool)
+        Self::new_internal(device, None, true, instance_buffer_pool, pixel_format)
     }
 
     fn create_device() -> metal::Device {
@@ -213,6 +228,7 @@ impl MetalRenderer {
         layer: Option<metal::MetalLayer>,
         opaque: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        pixel_format: MTLPixelFormat,
     ) -> Self {
         #[cfg(feature = "runtime_shaders")]
         let library = device
@@ -264,7 +280,7 @@ impl MetalRenderer {
             "paths_rasterization",
             "path_rasterization_vertex",
             "path_rasterization_fragment",
-            MTLPixelFormat::BGRA8Unorm,
+            pixel_format,
             PATH_SAMPLE_COUNT,
         );
         let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
@@ -273,7 +289,7 @@ impl MetalRenderer {
             "path_sprites",
             "path_sprite_vertex",
             "path_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
+            pixel_format,
         );
         let shadows_pipeline_state = build_pipeline_state(
             &device,
@@ -281,7 +297,7 @@ impl MetalRenderer {
             "shadows",
             "shadow_vertex",
             "shadow_fragment",
-            MTLPixelFormat::BGRA8Unorm,
+            pixel_format,
         );
         let quads_pipeline_state = build_pipeline_state(
             &device,
@@ -289,7 +305,7 @@ impl MetalRenderer {
             "quads",
             "quad_vertex",
             "quad_fragment",
-            MTLPixelFormat::BGRA8Unorm,
+            pixel_format,
         );
         let underlines_pipeline_state = build_pipeline_state(
             &device,
@@ -297,7 +313,7 @@ impl MetalRenderer {
             "underlines",
             "underline_vertex",
             "underline_fragment",
-            MTLPixelFormat::BGRA8Unorm,
+            pixel_format,
         );
         let monochrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -305,7 +321,7 @@ impl MetalRenderer {
             "monochrome_sprites",
             "monochrome_sprite_vertex",
             "monochrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
+            pixel_format,
         );
         let polychrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -313,7 +329,7 @@ impl MetalRenderer {
             "polychrome_sprites",
             "polychrome_sprite_vertex",
             "polychrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
+            pixel_format,
         );
         let surfaces_pipeline_state = build_pipeline_state(
             &device,
@@ -321,7 +337,7 @@ impl MetalRenderer {
             "surfaces",
             "surface_vertex",
             "surface_fragment",
-            MTLPixelFormat::BGRA8Unorm,
+            pixel_format,
         );
 
         let command_queue = device.new_command_queue();
@@ -354,6 +370,8 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
+            readback_target: None,
+            pixel_format,
         }
     }
 
@@ -408,7 +426,7 @@ impl MetalRenderer {
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.0 as u64);
         texture_descriptor.set_height(size.height.0 as u64);
-        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.set_pixel_format(self.pixel_format);
         texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
         texture_descriptor
             .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
@@ -645,6 +663,78 @@ impl MetalRenderer {
         // Commit without waiting, mirroring presentation to a real window where
         // the CPU doesn't block on the GPU.
         command_buffer.commit();
+        Ok(())
+    }
+
+    /// Renders a scene offscreen and copies the result into `pixels` as
+    /// tightly packed rows in the renderer's pixel format, reusing the render
+    /// target between frames. `pixels` must be `width * height * 4` bytes.
+    ///
+    /// This is the presentation path for hosts that display frames themselves,
+    /// such as a terminal, rather than through a `CAMetalLayer`.
+    pub fn render_scene_to_pixels(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        pixels: &mut [u8],
+    ) -> Result<()> {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            anyhow::bail!("Invalid size for render_scene_to_pixels: {:?}", size);
+        }
+        let bytes_per_row = size.width.0 as usize * 4;
+        anyhow::ensure!(
+            pixels.len() == bytes_per_row * size.height.0 as usize,
+            "pixel buffer does not match {size:?}"
+        );
+
+        let needs_new_target = self.readback_target.as_ref().is_none_or(|texture| {
+            texture.width() != size.width.0 as u64 || texture.height() != size.height.0 as u64
+        });
+        if needs_new_target {
+            self.update_path_intermediate_textures(size);
+            let texture_descriptor = metal::TextureDescriptor::new();
+            texture_descriptor.set_width(size.width.0 as u64);
+            texture_descriptor.set_height(size.height.0 as u64);
+            texture_descriptor.set_pixel_format(self.pixel_format);
+            texture_descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            // Shared storage lets the CPU read the texture without a blit on
+            // unified memory. Discrete GPUs cannot share textures.
+            texture_descriptor.set_storage_mode(if self.is_unified_memory {
+                metal::MTLStorageMode::Shared
+            } else {
+                metal::MTLStorageMode::Managed
+            });
+            self.readback_target = Some(self.device.new_texture(&texture_descriptor));
+        }
+        let target_texture = self
+            .readback_target
+            .clone()
+            .context("readback target was just created")?;
+
+        let command_buffer = self.render_frame(scene, &target_texture, size)?;
+        if !self.is_unified_memory {
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.synchronize_resource(&target_texture);
+            blit.end_encoding();
+        }
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        target_texture.get_bytes(
+            pixels.as_mut_ptr() as *mut c_void,
+            bytes_per_row as u64,
+            metal::MTLRegion {
+                origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                size: metal::MTLSize {
+                    width: size.width.0 as u64,
+                    height: size.height.0 as u64,
+                    depth: 1,
+                },
+            },
+            0,
+        );
         Ok(())
     }
 
@@ -1604,7 +1694,8 @@ pub struct MetalHeadlessRenderer {
 impl MetalHeadlessRenderer {
     pub fn new() -> Self {
         let instance_buffer_pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let renderer = MetalRenderer::new_headless(instance_buffer_pool);
+        let renderer =
+            MetalRenderer::new_headless(instance_buffer_pool, MTLPixelFormat::BGRA8Unorm);
         Self { renderer }
     }
 }

@@ -30,6 +30,12 @@ pub struct Keystroke {
     /// this binding was pressed.
     /// e.g. for s this is "s", for option-s "ß", and cmd-s None
     pub key_char: Option<String>,
+
+    /// The physical key that was pressed, layout-independent (`"KeyS"`, `"Digit1"`,
+    /// `"ArrowLeft"`), in the DOM `KeyboardEvent.code` spelling. `None` when the
+    /// platform cannot report one.
+    #[serde(default)]
+    pub code: Option<String>,
 }
 
 /// Represents a keystroke that can be used in keybindings and displayed to the user.
@@ -216,6 +222,7 @@ impl Keystroke {
             modifiers,
             key,
             key_char,
+            code: None,
         })
     }
 
@@ -773,4 +780,42 @@ fn unparse(modifiers: &Modifiers, key: &str) -> String {
     }
     result.push_str(&key);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_does_not_set_the_physical_key() {
+        let keystroke = Keystroke::parse("ctrl-shift-s").expect("valid keystroke");
+        assert_eq!(keystroke.key, "s");
+        assert_eq!(keystroke.code, None);
+        assert_eq!(keystroke.unparse(), "ctrl-shift-s");
+    }
+
+    /// The physical key is extra metadata: a binding written without one still matches.
+    #[test]
+    fn matching_ignores_the_physical_key() {
+        let typed = Keystroke {
+            modifiers: Modifiers::control(),
+            key: "s".to_string(),
+            key_char: None,
+            code: Some("KeyS".to_string()),
+        };
+        let target = Keystroke::parse("ctrl-s").expect("valid keystroke");
+
+        assert!(typed.should_match(&KeybindingKeystroke::from_keystroke(target)));
+    }
+
+    /// Keystrokes serialized before the physical key existed still deserialize.
+    #[test]
+    fn deserializes_keystrokes_without_a_physical_key() {
+        let keystroke: Keystroke =
+            serde_json::from_str(r#"{"modifiers":{"control":true},"key":"s","key_char":null}"#)
+                .expect("keystroke without a physical key should deserialize");
+
+        assert!(keystroke.modifiers.control);
+        assert_eq!(keystroke.code, None);
+    }
 }

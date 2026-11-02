@@ -1564,16 +1564,20 @@ fn parse_normal_key(
 ) -> Option<(Keystroke, bool)> {
     let (key_char, prefer_character_input) = process_key(vkey, lparam.hiword());
 
-    let key = parse_immutable(vkey).or_else(|| {
-        let scan_code = lparam.hiword() & 0xFF;
-        get_keystroke_key(vkey, scan_code as u32, &mut modifiers)
-    })?;
+    let scan_code = lparam.hiword() & 0xFF;
+    // Set 1 scan codes reuse a byte for unrelated keys; bit 24 disambiguates them.
+    let extended = ((lparam.0 >> 24) & 1) != 0;
+    let code = keystroke_code::from_windows_scancode(scan_code as u8, extended).map(str::to_owned);
+
+    let key = parse_immutable(vkey)
+        .or_else(|| get_keystroke_key(vkey, scan_code as u32, &mut modifiers))?;
 
     Some((
         Keystroke {
             modifiers,
             key,
             key_char,
+            code,
         },
         prefer_character_input,
     ))
