@@ -2,6 +2,7 @@ mod app_menu;
 mod keyboard;
 mod keystroke;
 pub mod keystroke_code;
+mod tray;
 
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 #[expect(missing_docs)]
@@ -50,7 +51,7 @@ use crate::{
 use anyhow::bail;
 use anyhow::{Context as _, Result};
 use async_task::Runnable;
-use futures::channel::oneshot;
+use futures::channel::{mpsc::UnboundedSender, oneshot};
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
@@ -81,6 +82,7 @@ use uuid::Uuid;
 pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
+pub use tray::*;
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use test::*;
@@ -301,6 +303,24 @@ pub trait Platform: 'static {
     ) {
         _ = callback;
     }
+
+    /// Creates an item in the operating system's tray, which shows an icon or
+    /// a short title outside of the application's windows.
+    ///
+    /// Returns `None` on platforms without tray support.
+    fn create_tray(&self, _options: TrayOptions) -> Option<Box<dyn PlatformTray>> {
+        None
+    }
+
+    /// Installs the sender that the application's tray items report events on.
+    ///
+    /// Backends must only send: tray events can arrive from inside a native
+    /// callback (AppKit's menu tracking, the Windows message loop, the Linux
+    /// tray service), where the application may be halfway through a turn.
+    /// The application drains the channel on the foreground instead.
+    ///
+    /// Subsequent calls replace the sender.
+    fn set_tray_event_sender(&self, _sender: UnboundedSender<TrayEvent>) {}
 
     fn compositor_name(&self) -> &'static str {
         ""

@@ -209,6 +209,7 @@ pub(crate) struct MacPlatformState {
     /// Mirrors `[NSCursor setHiddenUntilMouseMoves:]` state, which AppKit doesn't expose.
     cursor_visible: Arc<AtomicBool>,
     system_notifications: crate::system_notifications::SystemNotificationState,
+    tray_events: crate::tray::TrayEventSender,
 }
 
 impl MacPlatform {
@@ -257,6 +258,7 @@ impl MacPlatform {
             keyboard_mapper,
             cursor_visible: Arc::new(AtomicBool::new(true)),
             system_notifications: crate::system_notifications::SystemNotificationState::new(),
+            tray_events: crate::tray::new_event_sender(),
         }))
     }
 
@@ -1248,6 +1250,20 @@ impl Platform for MacPlatform {
         let mut state = self.0.lock();
         let executor = state.foreground_executor.clone();
         state.system_notifications.on_response(&executor, callback);
+    }
+
+    fn create_tray(&self, options: gpui::TrayOptions) -> Option<Box<dyn gpui::PlatformTray>> {
+        let events = self.0.lock().tray_events.clone();
+        Some(Box::new(crate::tray::MacTray::new(options, events)?))
+    }
+
+    fn set_tray_event_sender(
+        &self,
+        sender: futures::channel::mpsc::UnboundedSender<gpui::TrayEvent>,
+    ) {
+        // Events are sent from AppKit's menu-tracking loop, which must not
+        // reach gpui state; the sender only fills the channel.
+        *self.0.lock().tray_events.borrow_mut() = Some(sender);
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {

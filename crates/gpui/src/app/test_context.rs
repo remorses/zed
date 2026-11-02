@@ -215,6 +215,14 @@ impl TestAppContext {
         f(&cx)
     }
 
+    /// The sender the application installed for tray backends, if any.
+    #[cfg(test)]
+    pub(crate) fn tray_event_sender(
+        &self,
+    ) -> Option<futures::channel::mpsc::UnboundedSender<crate::TrayEvent>> {
+        self.test_platform.tray_event_sender()
+    }
+
     /// Adds a new window. The Window will always be backed by a `TestWindow` which
     /// can be retrieved with `self.test_window(handle)`
     pub fn add_window<F, V>(&mut self, build_window: F) -> WindowHandle<V>

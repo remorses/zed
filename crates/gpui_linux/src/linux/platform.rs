@@ -127,6 +127,7 @@ pub(crate) struct LinuxCommon {
     pub(crate) menus: Vec<OwnedMenu>,
     app_name: Option<String>,
     system_notifications: crate::linux::system_notifications::SystemNotificationState,
+    tray_events: crate::linux::tray::TrayEventSender,
     #[cfg_attr(
         not(all(target_os = "linux", any(feature = "wayland", feature = "x11"))),
         allow(dead_code)
@@ -170,6 +171,7 @@ impl LinuxCommon {
             app_name: None,
             system_notifications: crate::linux::system_notifications::SystemNotificationState::new(
             ),
+            tray_events: crate::linux::tray::new_event_sender(),
             wake_sender,
             wake_listener_started: false,
         };
@@ -592,6 +594,21 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
             let executor = common.foreground_executor.clone();
             common.system_notifications.on_response(&executor, callback)
         });
+    }
+
+    fn create_tray(&self, options: gpui::TrayOptions) -> Option<Box<dyn gpui::PlatformTray>> {
+        self.inner
+            .with_common(|common| crate::linux::tray::create(options, common.tray_events.clone()))
+    }
+
+    fn set_tray_event_sender(
+        &self,
+        sender: futures::channel::mpsc::UnboundedSender<gpui::TrayEvent>,
+    ) {
+        // Tray events arrive from the StatusNotifierItem service thread, which
+        // must not reach gpui state; the sender only fills the channel.
+        self.inner
+            .with_common(|common| *common.tray_events.lock() = Some(sender));
     }
 
     fn on_app_menu_action(&self, callback: Box<dyn FnMut(&dyn Action)>) {

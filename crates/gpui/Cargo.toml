@@ -205,6 +205,10 @@ path = "examples/set_menus.rs"
 name = "system_notifications"
 path = "examples/system_notifications.rs"
 
+[[example]]
+name = "tray"
+path = "examples/tray.rs"
+
 
 [[example]]
 name = "shadow"

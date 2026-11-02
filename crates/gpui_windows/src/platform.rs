@@ -51,6 +51,7 @@ pub struct WindowsPlatform {
     has_package_identity: bool,
     app_identity: RefCell<Option<(String, String)>>,
     system_notifications: RefCell<SystemNotificationState>,
+    tray_events: TrayEventSender,
 }
 
 struct WindowsPlatformInner {
@@ -210,6 +211,7 @@ impl WindowsPlatform {
             invalidate_devices: Arc::new(AtomicBool::new(false)),
             app_identity: RefCell::new(None),
             system_notifications: RefCell::new(SystemNotificationState::new()),
+            tray_events: new_event_sender(),
         })
     }
 
@@ -737,6 +739,20 @@ impl Platform for WindowsPlatform {
         self.system_notifications
             .borrow_mut()
             .on_response(&self.foreground_executor, callback);
+    }
+
+    fn create_tray(&self, options: gpui::TrayOptions) -> Option<Box<dyn gpui::PlatformTray>> {
+        let tray = WindowsTray::new(options, self.tray_events.clone())?;
+        Some(Box::new(WindowsTrayHandle::new(tray)))
+    }
+
+    fn set_tray_event_sender(
+        &self,
+        sender: futures::channel::mpsc::UnboundedSender<gpui::TrayEvent>,
+    ) {
+        // Tray events arrive from the message loop, which must not reach gpui
+        // state; the sender only fills the channel.
+        *self.tray_events.borrow_mut() = Some(sender);
     }
 
     fn set_menus(&self, menus: Vec<Menu>, _keymap: &Keymap) {
@@ -1398,7 +1414,7 @@ fn file_save_dialog(
     Ok(Some(PathBuf::from(file_path_string)))
 }
 
-fn load_icon() -> Result<HICON> {
+pub(crate) fn load_icon() -> Result<HICON> {
     let module = unsafe { GetModuleHandleW(None).context("unable to get module handle")? };
     let handle = unsafe {
         LoadImageW(
