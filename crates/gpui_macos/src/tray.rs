@@ -200,11 +200,18 @@ const MENU_BAR_ICON_HEIGHT: f64 = 18.0;
 /// Loads an image from disk, fitted to the menu bar's height.
 ///
 /// A status item draws its image at the image's own point size, so an app
-/// icon would otherwise fill the bar. Template rendering is left to the
-/// artwork: the image is used as-is so that colored icons keep their color.
+/// icon would otherwise fill the bar. Colored icons keep their color; a file
+/// whose name ends in `Template` (`trayTemplate.png`, AppKit's naming rule for
+/// `imageNamed:`) is a template image, which AppKit tints to match the menu
+/// bar in light and dark mode.
 fn load_image(path: &Path) -> Option<Retained<NSImage>> {
+    let template = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.ends_with("Template"));
     let path = path.to_str()?;
     let image = NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(path))?;
+    image.setTemplate(template);
     let size = image.size();
     if size.height > 0.0 {
         let scale = MENU_BAR_ICON_HEIGHT / size.height;

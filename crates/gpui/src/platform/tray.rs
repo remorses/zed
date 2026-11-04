@@ -25,7 +25,9 @@ pub struct TrayOptions {
     /// Path to an image shown in the tray.
     ///
     /// The formats are the platform's: `.icns` and `.png` on macOS, `.ico` on
-    /// Windows, and anything the `image` crate decodes on Linux. When the image
+    /// Windows, and anything the `image` crate decodes on Linux. On macOS a
+    /// file whose name ends in `Template` (`trayTemplate.png`) is drawn as a
+    /// template image, tinted to match the menu bar. When the image
     /// cannot be loaded, or this is `None`, the item falls back to
     /// [`Self::title`].
     pub icon: Option<PathBuf>,
