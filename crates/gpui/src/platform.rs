@@ -88,7 +88,7 @@ pub use tray::*;
 pub(crate) use test::*;
 
 #[cfg(any(test, feature = "test-support"))]
-pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
+pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream, TestTrayState};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use threaded_dispatcher::ThreadedDispatcher;

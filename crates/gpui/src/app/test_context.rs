@@ -5,8 +5,8 @@ use crate::{
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Platform, Point, Render, Result, SharedString, Size, SystemNotification,
     SystemNotificationResponse, Task, TestDispatcher, TestPlatform, TestScreenCaptureSource,
-    TestWindow, TextSystem, VisualContext, Window, WindowBounds, WindowHandle, WindowOptions,
-    app::GpuiMode, window::ElementArenaScope,
+    TestTrayState, TestWindow, TextSystem, TrayEvent, VisualContext, Window, WindowBounds,
+    WindowHandle, WindowOptions, app::GpuiMode, window::ElementArenaScope,
 };
 use anyhow::{anyhow, bail};
 use futures::{Stream, StreamExt, channel::oneshot};
@@ -398,6 +398,22 @@ impl TestAppContext {
     /// Returns the tags of all system notifications dismissed during this test, in order.
     pub fn dismissed_system_notifications(&self) -> Vec<SharedString> {
         self.test_platform.dismissed_system_notifications()
+    }
+
+    /// Returns snapshots of all tray items created during this test, in creation order.
+    ///
+    /// Dropped trays remain in this list with [`TestTrayState::removed`] set, so tests
+    /// can assert both their final visible state and their removal.
+    pub fn tray_states(&self) -> Vec<TestTrayState> {
+        self.test_platform.tray_states()
+    }
+
+    /// Simulates the user activating the tray item or choosing one of its menu items.
+    ///
+    /// The event is sent through the same channel native backends use, so the registered
+    /// handler runs only after the foreground executor drains it.
+    pub fn simulate_tray_event(&self, event: TrayEvent) {
+        self.test_platform.simulate_tray_event(event);
     }
 
     /// Simulates the user activating a system notification.

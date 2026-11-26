@@ -134,9 +134,9 @@ impl TrayHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestAppContext;
+    use crate::{TestAppContext, TestTrayState};
     use futures::channel::mpsc::UnboundedSender;
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     #[derive(Default)]
     struct Calls {
@@ -190,6 +190,75 @@ mod tests {
 
         handle.remove();
         assert!(calls.borrow().removed);
+    }
+
+    #[gpui::test]
+    fn test_platform_records_tray_state_and_removal(cx: &mut TestAppContext) {
+        let tray = cx
+            .update(|cx| {
+                cx.create_tray(TrayOptions {
+                    icon: Some(PathBuf::from("/tmp/tray.icns")),
+                    title: Some("GPUI".into()),
+                    tooltip: Some("gpui".into()),
+                })
+            })
+            .expect("test platform supports trays");
+
+        assert_eq!(
+            cx.tray_states(),
+            [TestTrayState {
+                icon: Some(PathBuf::from("/tmp/tray.icns")),
+                title: Some("GPUI".into()),
+                tooltip: Some("gpui".into()),
+                menu: Vec::new(),
+                removed: false,
+            }]
+        );
+
+        let item = TrayMenuItem {
+            id: "open".into(),
+            label: "Open".into(),
+            enabled: true,
+            checked: false,
+        };
+        tray.set_menu(vec![item.clone()]);
+        tray.set_tooltip(Some("updated tooltip".into()));
+        tray.set_title(Some("2".into()));
+
+        assert_eq!(
+            cx.tray_states(),
+            [TestTrayState {
+                icon: Some(PathBuf::from("/tmp/tray.icns")),
+                title: Some("2".into()),
+                tooltip: Some("updated tooltip".into()),
+                menu: vec![item],
+                removed: false,
+            }]
+        );
+
+        tray.remove();
+        assert!(cx.tray_states().first().expect("created tray").removed);
+    }
+
+    #[gpui::test]
+    fn simulate_tray_event_uses_the_application_handler(cx: &mut TestAppContext) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let events = events.clone();
+            cx.on_tray_event(move |event, _| events.borrow_mut().push(event));
+        });
+
+        cx.simulate_tray_event(TrayEvent::MenuItem("open".into()));
+        assert!(
+            events.borrow().is_empty(),
+            "tray events are drained on the foreground"
+        );
+
+        cx.run_until_parked();
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[TrayEvent::MenuItem("open".into())]
+        );
     }
 
     fn sender(cx: &TestAppContext) -> UnboundedSender<TrayEvent> {
