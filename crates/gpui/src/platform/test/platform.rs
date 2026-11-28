@@ -2,9 +2,10 @@ use crate::{
     AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
     DummyKeyboardMapper, ForegroundExecutor, Keymap, NoopTextSystem, PathPromptOptions, Platform,
     PlatformDisplay, PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper,
-    PlatformTextSystem, PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
-    SharedString, SourceMetadata, SystemNotification, SystemNotificationResponse, Task,
-    TestDisplay, TestWindow, ThermalState, TrayEvent, WindowAppearance, WindowParams, size,
+    PlatformTextSystem, PlatformTray, PromptButton, ScreenCaptureFrame, ScreenCaptureSource,
+    ScreenCaptureStream, SharedString, SourceMetadata, SystemNotification,
+    SystemNotificationResponse, Task, TestDisplay, TestWindow, ThermalState, TrayEvent,
+    TrayMenuItem, TrayOptions, WindowAppearance, WindowParams, size,
 };
 use anyhow::Result;
 use collections::VecDeque;
@@ -16,6 +17,50 @@ use std::{
     rc::{Rc, Weak},
     sync::Arc,
 };
+
+/// A snapshot of a tray item created through the test platform.
+///
+/// The test platform keeps these states after the tray is dropped so tests can
+/// assert both the last visible state and the removal itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TestTrayState {
+    /// Path to the image shown in the tray, if one was provided at creation.
+    pub icon: Option<PathBuf>,
+
+    /// Text currently shown when there is no icon.
+    pub title: Option<SharedString>,
+
+    /// Text currently shown while the pointer hovers over the item.
+    pub tooltip: Option<SharedString>,
+
+    /// The item's current menu.
+    pub menu: Vec<TrayMenuItem>,
+
+    /// Whether the tray handle was dropped, removing the item from the system.
+    pub removed: bool,
+}
+
+struct TestTray(Rc<RefCell<TestTrayState>>);
+
+impl PlatformTray for TestTray {
+    fn set_menu(&self, items: Vec<TrayMenuItem>) {
+        self.0.borrow_mut().menu = items;
+    }
+
+    fn set_tooltip(&self, tooltip: Option<SharedString>) {
+        self.0.borrow_mut().tooltip = tooltip;
+    }
+
+    fn set_title(&self, title: Option<SharedString>) {
+        self.0.borrow_mut().title = title;
+    }
+}
+
+impl Drop for TestTray {
+    fn drop(&mut self) {
+        self.0.borrow_mut().removed = true;
+    }
+}
 
 /// TestPlatform implements the Platform trait for use in tests.
 pub(crate) struct TestPlatform {
@@ -34,6 +79,7 @@ pub(crate) struct TestPlatform {
     screen_capture_sources: RefCell<Vec<TestScreenCaptureSource>>,
     pub opened_url: RefCell<Option<String>>,
     pub(crate) system_notifications: RefCell<TestSystemNotifications>,
+    trays: RefCell<Vec<Rc<RefCell<TestTrayState>>>>,
     tray_event_sender: RefCell<Option<UnboundedSender<TrayEvent>>>,
     pub text_system: Arc<dyn PlatformTextSystem>,
     pub expect_restart:
@@ -147,6 +193,7 @@ impl TestPlatform {
             weak: weak.clone(),
             opened_url: Default::default(),
             system_notifications: Default::default(),
+            trays: Default::default(),
             tray_event_sender: Default::default(),
             text_system,
             headless_renderer_factory,
@@ -156,6 +203,25 @@ impl TestPlatform {
     #[cfg(test)]
     pub(crate) fn tray_event_sender(&self) -> Option<UnboundedSender<TrayEvent>> {
         self.tray_event_sender.borrow().clone()
+    }
+
+    pub(crate) fn tray_states(&self) -> Vec<TestTrayState> {
+        self.trays
+            .borrow()
+            .iter()
+            .map(|tray| tray.borrow().clone())
+            .collect()
+    }
+
+    pub(crate) fn simulate_tray_event(&self, event: TrayEvent) {
+        let sender = self
+            .tray_event_sender
+            .borrow()
+            .clone()
+            .expect("no tray event handler has been registered");
+        sender
+            .unbounded_send(event)
+            .expect("tray event handler is no longer listening");
     }
 
     pub(crate) fn simulate_new_path_selection(
@@ -507,6 +573,18 @@ impl Platform for TestPlatform {
         callback: Box<dyn FnMut(SystemNotificationResponse)>,
     ) {
         self.system_notifications.borrow_mut().response_callback = Some(callback);
+    }
+
+    fn create_tray(&self, options: TrayOptions) -> Option<Box<dyn PlatformTray>> {
+        let state = Rc::new(RefCell::new(TestTrayState {
+            icon: options.icon,
+            title: options.title,
+            tooltip: options.tooltip,
+            menu: Vec::new(),
+            removed: false,
+        }));
+        self.trays.borrow_mut().push(state.clone());
+        Some(Box::new(TestTray(state)))
     }
 
     fn set_tray_event_sender(&self, sender: UnboundedSender<TrayEvent>) {
